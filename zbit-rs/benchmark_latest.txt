@@ -1,0 +1,30 @@
+zBit-rs Real File Benchmark Report
+Generated: 2026-04-23 10:27:18
+Input file: ../studies/algorithmsResearch.md
+Compressed artifact: benchmark_algorithmsResearch.zbpk
+
+Selected method: indexed-raw
+Selection reason: indexed-raw improves size: 61885 -> 54263 bytes
+Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
+
+Raw candidate size (bytes): 61885
+Indexed-raw candidate size (bytes): 54263
+Indexed-circuit candidate size (bytes): skipped by rules
+
+Original size (bytes): 61849
+Compressed size (bytes): 54263
+Compression ratio (compressed/original): 0.877346
+Space savings (%): 12.27
+
+Compression time (ms): 6.910
+Decompression time (ms): 8.846
+Compression throughput (MiB/s): 8.536
+Decompression throughput (MiB/s): 6.668
+
+Unique symbols: 109
+Bits per symbol index: 7
+Raw dictionary bytes: 109
+Circuit dictionary bytes: 0
+Packed index payload bytes: 54118
+
+Output validation: PASS
