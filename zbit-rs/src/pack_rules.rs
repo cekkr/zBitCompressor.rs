@@ -1,3 +1,6 @@
+// Licensed under the PolyForm Noncommercial License 1.0.0. See LICENSE.
+// Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PackMethod {
     RawCopy,

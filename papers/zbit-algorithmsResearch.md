@@ -1,3 +1,6 @@
+<!-- Licensed under the PolyForm Noncommercial License 1.0.0. See [LICENSE](../LICENSE). -->
+<!-- Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>. -->
+
 # A Comprehensive Analysis of
 
 # Algorithmic Approaches for Two-Level

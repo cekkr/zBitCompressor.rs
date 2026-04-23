@@ -23,7 +23,7 @@ cargo run --bin zbit-rs
 
 ```bash
 cargo run --bin zbit-benchmark -- \
-  ../studies/algorithmsResearch.md \
+  ../papers/zbit-algorithmsResearch.md \
   benchmark_algorithmsResearch.zbpk \
   benchmark_latest.txt
 ```

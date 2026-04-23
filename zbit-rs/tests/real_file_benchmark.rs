@@ -1,10 +1,13 @@
+// Licensed under the PolyForm Noncommercial License 1.0.0. See LICENSE.
+// Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zbit_rs::{compress_adaptive_to_file, decompress_file};
 
 #[test]
 fn adaptive_pack_real_file_roundtrip_and_size_guard() {
-    let input_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../studies/algorithmsResearch.md");
+    let input_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/zbit-algorithmsResearch.md");
     let input = std::fs::read(&input_path).expect("read algorithmsResearch.md");
 
     let stamp = SystemTime::now()

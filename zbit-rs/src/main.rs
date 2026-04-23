@@ -1,3 +1,6 @@
+// Licensed under the PolyForm Noncommercial License 1.0.0. See LICENSE.
+// Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
+
 use zbit_rs::{ZbitModel, ZbitResult};
 
 fn validate_case(

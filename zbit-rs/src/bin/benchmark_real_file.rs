@@ -1,3 +1,6 @@
+// Licensed under the PolyForm Noncommercial License 1.0.0. See LICENSE.
+// Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
+
 use std::env;
 use std::fs;
 use std::time::{Instant, SystemTime};
@@ -74,7 +77,7 @@ mod chrono_like {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_path = env::args()
         .nth(1)
-        .unwrap_or_else(|| "../studies/algorithmsResearch.md".to_string());
+        .unwrap_or_else(|| "../papers/zbit-algorithmsResearch.md".to_string());
     let pack_path = env::args()
         .nth(2)
         .unwrap_or_else(|| "benchmark_algorithmsResearch.zbpk".to_string());
