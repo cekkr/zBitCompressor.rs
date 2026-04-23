@@ -12,6 +12,7 @@
 - License file: `LICENSE`
 
 ## Recent Updates
+- 2026-04-23: Replaced root `README.md` with a theory-to-implementation guide aligned to `papers/zbit-algorithmsResearch.md` and current `zbit-rs` capabilities (exact bounded minimization, adaptive packing, validation workflow, and documented non-implemented roadmap items).
 - 2026-04-23: Updated moved sample paper path references from `../studies/algorithmsResearch.md` to `../papers/zbit-algorithmsResearch.md` in tests, benchmark binary defaults, and crate README.
 - 2026-04-23: Added short license/copyright headers to all Rust source/test files and markdown files under `papers/`.
 - 2026-04-23: Updated copyright headers to include year and contact: `Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.`
