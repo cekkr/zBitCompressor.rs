@@ -2,6 +2,10 @@
 
 Rust migration of the `zBit` compression model with:
 - exact small-support minimization (Quine-McCluskey + exact cover)
+- Espresso-style iterative cover heuristics
+- AIG-style rewriting/resubstitution + balancing-aware scoring
+- SAT-assisted local redundancy pruning
+- technology-aware objective mapping (ASIC area/delay and FPGA LUT4/LUT6 proxies)
 - canonical DAG interning for gates
 - model serialization/deserialization (`.zbit`)
 - adaptive pack strategy (`raw-copy`, `indexed-raw`, `indexed-circuit`)
@@ -18,6 +22,12 @@ cargo test
 ```bash
 cargo run --bin zbit-rs
 ```
+
+## Advanced API (Library)
+
+`ZbitModel` now exposes:
+- `compress_from_table_advanced(outputs, dont_cares, &AdvancedOptions)`
+- `compress_from_table_with_objective(outputs, dont_cares, MappingObjective)`
 
 ## Real File Benchmark
 

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use crate::advanced::{minimize_advanced, AdvancedOptions, AdvancedReport, MappingObjective};
 use crate::error::{ZbitError, ZbitResult};
 use crate::minimizer::{minimize_exact, Implicant};
 
@@ -354,7 +355,12 @@ impl ZbitModel {
         Ok(())
     }
 
-    pub fn compress_from_table(&mut self, outputs: &[u8], dont_cares: Option<&[u8]>) -> ZbitResult<()> {
+    fn collect_sets_from_table(
+        &self,
+        outputs: &[u8],
+        dont_cares: Option<&[u8]>,
+        require_exact_bound: bool,
+    ) -> ZbitResult<(Vec<u32>, Vec<u32>)> {
         let table_size = self.table_size()?;
         if outputs.len() != table_size {
             return Err(ZbitError::InvalidArg(
@@ -362,7 +368,7 @@ impl ZbitModel {
             ));
         }
 
-        if self.num_inputs > ZBIT_MAX_INPUTS_EXACT {
+        if require_exact_bound && self.num_inputs > ZBIT_MAX_INPUTS_EXACT {
             return Err(ZbitError::Limit(format!(
                 "exact minimization supports up to {ZBIT_MAX_INPUTS_EXACT} inputs"
             )));
@@ -387,11 +393,45 @@ impl ZbitModel {
             }
         }
 
+        Ok((on_set, dc_set))
+    }
+
+    pub fn compress_from_table(&mut self, outputs: &[u8], dont_cares: Option<&[u8]>) -> ZbitResult<()> {
+        let (on_set, dc_set) = self.collect_sets_from_table(outputs, dont_cares, true)?;
+
         let (implicants, literal_count) = minimize_exact(self.num_inputs, &on_set, &dc_set)?;
         self.build_from_implicants(&implicants)?;
         self.implicant_count = implicants.len() as u32;
         self.literal_count = literal_count;
         Ok(())
+    }
+
+    pub fn compress_from_table_advanced(
+        &mut self,
+        outputs: &[u8],
+        dont_cares: Option<&[u8]>,
+        options: &AdvancedOptions,
+    ) -> ZbitResult<AdvancedReport> {
+        let (on_set, dc_set) = self.collect_sets_from_table(outputs, dont_cares, false)?;
+
+        let result = minimize_advanced(self.num_inputs, &on_set, &dc_set, options)?;
+        self.build_from_implicants(&result.implicants)?;
+        self.implicant_count = result.implicants.len() as u32;
+        self.literal_count = result.literal_count;
+        Ok(result.report)
+    }
+
+    pub fn compress_from_table_with_objective(
+        &mut self,
+        outputs: &[u8],
+        dont_cares: Option<&[u8]>,
+        objective: MappingObjective,
+    ) -> ZbitResult<AdvancedReport> {
+        let options = AdvancedOptions {
+            objective,
+            ..AdvancedOptions::default()
+        };
+        self.compress_from_table_advanced(outputs, dont_cares, &options)
     }
 
     pub fn evaluate(&self, input_vector: u32) -> ZbitResult<bool> {

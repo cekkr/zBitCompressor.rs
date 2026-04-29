@@ -12,6 +12,8 @@
 - License file: `LICENSE`
 
 ## Recent Updates
+- 2026-04-29: Implemented advanced library optimization flow in `zbit-rs` with Espresso-style iterative cover heuristics, AIG-style rewrite/resubstitution passes, SAT-assisted local redundancy pruning, and technology-aware objectives (ASIC area/delay, FPGA LUT4/LUT6), plus model entrypoints and new validation tests (`zbit-rs/src/advanced.rs`, `zbit-rs/src/sat.rs`, `zbit-rs/tests/advanced_validation.rs`).
+- 2026-04-29: Added `OPENCLAW.md` with a practical handoff guide for continuing this repository with a simpler local AI agent (task scoping, prompt template, validation gates, and escalation criteria).
 - 2026-04-23: Replaced root `README.md` with a theory-to-implementation guide aligned to `papers/zbit-algorithmsResearch.md` and current `zbit-rs` capabilities (exact bounded minimization, adaptive packing, validation workflow, and documented non-implemented roadmap items).
 - 2026-04-23: Updated moved sample paper path references from `../studies/algorithmsResearch.md` to `../papers/zbit-algorithmsResearch.md` in tests, benchmark binary defaults, and crate README.
 - 2026-04-23: Added short license/copyright headers to all Rust source/test files and markdown files under `papers/`.

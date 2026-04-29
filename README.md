@@ -29,7 +29,7 @@ Code:
 - `zbit-rs/src/minimizer.rs`
 - `zbit-rs/src/model.rs`
 
-### 2. Canonical structural representation
+### 2. Canonical structural representation + rewrite-ready flow
 
 Paper guidance: representation choice matters.
 
@@ -38,12 +38,64 @@ Implemented:
 - canonical node interning (`Pin`, `Not`, `And`, `Or`, `Xor`)
 - commutative normalization and simplification rules
 - deterministic serialized model format (`.zbit`)
+- advanced rewrite flow with:
+  - graph-style resubstitution (absorbed-term elimination)
+  - AIG-like consensus merges (local rewriting)
+  - balancing-aware objective estimation
 
 Code:
 
 - `zbit-rs/src/model.rs`
+- `zbit-rs/src/advanced.rs`
 
-### 3. Representation-aware adaptive packing
+### 3. Espresso-style iterative cover heuristics
+
+Paper guidance: large search spaces need iterative heuristic improvements in addition to exact bounded methods.
+
+Implemented:
+
+- iterative expand/select loop inspired by Espresso-style cover refinement
+- legal expansion under ON+DC constraints
+- greedy objective-aware cube selection and irredundancy cleanup
+
+Code:
+
+- `zbit-rs/src/advanced.rs`
+
+### 4. SAT-assisted local exactness
+
+Paper guidance: SAT is useful as a bounded local oracle inside larger heuristic flows.
+
+Implemented:
+
+- lightweight CNF SAT solver (DPLL with unit propagation)
+- SAT-driven local redundancy pruning for cubes in a candidate cover
+- bounded SAT window control (`sat_local_exact_inputs`)
+
+Code:
+
+- `zbit-rs/src/sat.rs`
+- `zbit-rs/src/advanced.rs`
+
+### 5. Technology-aware mapping objectives
+
+Paper guidance: objective function must match target technology, not just literal count.
+
+Implemented:
+
+- objective-aware scoring for:
+  - literal minimization
+  - ASIC area proxy
+  - ASIC delay proxy
+  - FPGA LUT4/LUT6 proxies
+- advanced model entrypoints with explicit objective selection
+
+Code:
+
+- `zbit-rs/src/advanced.rs`
+- `zbit-rs/src/model.rs`
+
+### 6. Representation-aware adaptive packing
 
 Paper guidance: choose method by objective/cost, avoid one fixed algorithm worldview.
 
@@ -62,30 +114,24 @@ Code:
 - `zbit-rs/src/pack.rs`
 - `zbit-rs/src/pack_rules.rs`
 
-### 4. Validation and benchmark as first-class workflow
+### 7. Validation and benchmark as first-class workflow
 
 Paper guidance: implementation quality requires verification + measurement loops.
 
 Implemented:
 
-- unit + integration tests for model roundtrip, don't-cares, and pack roundtrip
+- unit + integration tests for:
+  - exact minimization
+  - Espresso-style heuristic optimization
+  - SAT local pruning
+  - objective-aware advanced compression
+  - model and pack roundtrip validation
 - benchmark binary with method rationale, candidate sizes, timings, throughput, ratio, and output validation
 
 Code:
 
 - `zbit-rs/tests/`
 - `zbit-rs/src/bin/benchmark_real_file.rs`
-
-## What Is Not Implemented Yet
-
-Compared to the full long-term paper recommendations, the current crate does **not** yet implement:
-
-- Espresso-style iterative cover heuristics
-- graph-network/AIG rewriting, balancing, or resubstitution flows
-- SAT-assisted local exactness
-- technology-aware mapping objectives (ASIC/FPGA cost models)
-
-Current status is an exact small-function engine plus adaptive byte-stream packing.
 
 ## Repository Layout
 
@@ -99,6 +145,8 @@ Inside `zbit-rs/`:
 - `src/lib.rs`: public API
 - `src/model.rs`: exact Boolean model + `.zbit` serialization
 - `src/minimizer.rs`: exact minimization engine
+- `src/advanced.rs`: heuristic/rewrite/SAT/objective optimization flow
+- `src/sat.rs`: internal SAT solver used by local exactness pruning
 - `src/pack.rs`: adaptive `.zbpk` compression/decompression
 - `src/pack_rules.rs`: method-selection rules
 - `src/bin/benchmark_real_file.rs`: real-file benchmark binary
@@ -137,6 +185,14 @@ let outputs = [0u8, 1, 1, 0];
 let mut model = ZbitModel::new(2)?;
 model.compress_from_table(&outputs, None)?;
 model.validate_against_table(&outputs)?;
+
+// Advanced flow with technology-aware objective
+let report = model.compress_from_table_with_objective(
+    &outputs,
+    None,
+    zbit_rs::MappingObjective::FpgaLut6,
+)?;
+assert!(report.selected.estimated_luts > 0);
 
 // Pack/unpack bytes
 let input = b"abcabcabc";
