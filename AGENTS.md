@@ -12,6 +12,7 @@
 - License file: `LICENSE`
 
 ## Recent Updates
+- 2026-04-30: Enhanced `zbit-rs/scripts/benchmark_cat_challenge.sh` with PNG sanity reporting (size, resolution, bit depth, color type) and warnings when the downloaded asset differs from the expected 40MB/16-bit HDR profile; current download is ~2.83 MiB, 8-bit RGBA PNG, which is effectively incompressible by the current lossless methods and therefore selects raw-copy.
 - 2026-04-30: Added `raw-zstd` as a new adaptive packing candidate/method with roundtrip decode support and benchmark-candidate reporting; refreshed paper benchmark now selects `raw-zstd` with ratio `0.338176` (62015 -> 20972 bytes, validation PASS), improving over prior `raw-deflate` ratio `0.355849`.
 - 2026-04-30: Added cat challenge automation under `zbit-rs/scripts/benchmark_cat_challenge.sh` and ignored test hook `zbit-rs/tests/cat_challenge_benchmark.rs`; script downloads `assets/cat_challenge.png` only if missing and regenerates tracked report `zbit-rs/benchmark_cat_challenge_latest.txt`.
 - 2026-04-30: Updated `.gitignore` to ignore `assets/cat_challenge.png` and generated `zbit-rs/*.zbpk` artifacts.
