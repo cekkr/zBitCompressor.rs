@@ -16,3 +16,4 @@ name = "zbit-benchmark"
 path = "src/bin/benchmark_real_file.rs"
 
 [dependencies]
+flate2 = "1.1"

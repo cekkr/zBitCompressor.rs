@@ -7,6 +7,7 @@ pub enum PackMethod {
     IndexedRaw,
     IndexedCircuit,
     IndexedHuffman,
+    RawDeflate,
 }
 
 impl PackMethod {
@@ -16,6 +17,7 @@ impl PackMethod {
             Self::IndexedRaw => 1,
             Self::IndexedCircuit => 2,
             Self::IndexedHuffman => 3,
+            Self::RawDeflate => 4,
         }
     }
 
@@ -25,6 +27,7 @@ impl PackMethod {
             1 => Some(Self::IndexedRaw),
             2 => Some(Self::IndexedCircuit),
             3 => Some(Self::IndexedHuffman),
+            4 => Some(Self::RawDeflate),
             _ => None,
         }
     }
@@ -35,6 +38,7 @@ impl PackMethod {
             Self::IndexedRaw => "indexed-raw",
             Self::IndexedCircuit => "indexed-circuit",
             Self::IndexedHuffman => "indexed-huffman",
+            Self::RawDeflate => "raw-deflate",
         }
     }
 }
@@ -51,6 +55,7 @@ pub struct PackEvaluation {
 
     pub indexed_circuit_total_bytes: Option<usize>,
     pub indexed_huffman_total_bytes: Option<usize>,
+    pub raw_deflate_total_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -67,6 +72,7 @@ impl PackEvaluation {
             indexed_raw_total_bytes: 0,
             indexed_circuit_total_bytes: None,
             indexed_huffman_total_bytes: None,
+            raw_deflate_total_bytes: None,
             chosen_method: PackMethod::RawCopy,
             chosen_reason: String::new(),
         }
@@ -132,6 +138,17 @@ pub fn choose_best_method(eval: &mut PackEvaluation) {
             best_reason = format!(
                 "indexed-huffman improves size: {} -> {} bytes",
                 eval.raw_total_bytes, huffman_size
+            );
+        }
+    }
+
+    if let Some(deflate_size) = eval.raw_deflate_total_bytes {
+        if deflate_size < best_size {
+            best_method = PackMethod::RawDeflate;
+            best_size = deflate_size;
+            best_reason = format!(
+                "raw-deflate improves size: {} -> {} bytes",
+                eval.raw_total_bytes, deflate_size
             );
         }
     }

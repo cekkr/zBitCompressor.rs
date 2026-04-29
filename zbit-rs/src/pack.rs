@@ -4,16 +4,19 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::error::{ZbitError, ZbitResult};
 use crate::model::ZbitModel;
 use crate::pack_rules::{choose_best_method, should_evaluate_circuit, PackEvaluation, PackMethod};
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 
 pub const ZBPK_MAGIC: u32 = 0x5A42_504B; // "ZBPK"
 pub const ZBPK_VERSION: u16 = 2;
 pub const ZBPK_HEADER_BYTES: usize = 36;
 const MAX_HUFFMAN_CODE_BITS: u8 = 56;
+const ZBPK_MAX_OUTPUT_BYTES: usize = 1usize << 30; // 1 GiB hard safety bound
 
 #[derive(Debug, Clone)]
 pub struct PackStats {
@@ -32,6 +35,7 @@ pub struct PackStats {
     pub indexed_raw_candidate_bytes: usize,
     pub indexed_circuit_candidate_bytes: Option<usize>,
     pub indexed_huffman_candidate_bytes: Option<usize>,
+    pub raw_deflate_candidate_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -446,6 +450,37 @@ fn decode_huffman_payload(
     Ok(out)
 }
 
+fn build_raw_deflate_payload(input: &[u8]) -> ZbitResult<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(input)
+        .map_err(|e| ZbitError::Io(format!("zlib write failed: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| ZbitError::Io(format!("zlib finish failed: {e}")))
+}
+
+fn decode_raw_deflate_payload(payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(payload);
+    let mut out = Vec::with_capacity(original_size.min(1 << 20));
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| ZbitError::Parse(format!("zlib decode failed: {e}")))?;
+
+    if out.len() != original_size {
+        return Err(ZbitError::Parse(format!(
+            "raw-deflate output length mismatch: expected {original_size} got {}",
+            out.len()
+        )));
+    }
+
+    Ok(out)
+}
+
 fn model_blob_for_symbol(symbol: u8) -> ZbitResult<Vec<u8>> {
     let mut outputs = [0u8; 8];
     for i in 0..8u32 {
@@ -541,6 +576,7 @@ fn write_pack_bytes(
     circuit_blobs: Option<&[Vec<u8>]>,
     circuit_dict_bytes: usize,
     huffman_stream: Option<&HuffmanStream>,
+    raw_deflate_payload: Option<&[u8]>,
 ) -> ZbitResult<Vec<u8>> {
     if stream.unique_symbols.len() > u16::MAX as usize {
         return Err(ZbitError::Limit(
@@ -572,6 +608,12 @@ fn write_pack_bytes(
                 hs.symbols.len() * 2,
                 hs.payload.len(),
             )
+        }
+        PackMethod::RawDeflate => {
+            let payload = raw_deflate_payload.ok_or_else(|| {
+                ZbitError::Internal("raw-deflate payload missing for raw-deflate method".to_string())
+            })?;
+            (0u8, 0usize, 0usize, payload.len())
         }
     };
 
@@ -624,6 +666,7 @@ fn write_pack_bytes(
                 out.push(len);
             }
         }
+        PackMethod::RawDeflate => {}
     }
 
     match method {
@@ -634,6 +677,12 @@ fn write_pack_bytes(
                 ZbitError::Internal("huffman stream missing for indexed-huffman payload".to_string())
             })?;
             out.extend_from_slice(&hs.payload);
+        }
+        PackMethod::RawDeflate => {
+            let payload = raw_deflate_payload.ok_or_else(|| {
+                ZbitError::Internal("raw-deflate payload missing for raw-deflate method".to_string())
+            })?;
+            out.extend_from_slice(&payload);
         }
     }
 
@@ -650,6 +699,8 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     let indexed_huffman_candidate_bytes = huffman_stream
         .as_ref()
         .map(|hs| ZBPK_HEADER_BYTES + hs.symbols.len() * 2 + hs.payload.len());
+    let raw_deflate_payload = build_raw_deflate_payload(input)?;
+    let raw_deflate_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_deflate_payload.len());
 
     let mut eval = PackEvaluation::new();
     eval.original_size = input.len();
@@ -659,6 +710,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     eval.raw_total_bytes = raw_candidate_bytes;
     eval.indexed_raw_total_bytes = indexed_raw_candidate_bytes;
     eval.indexed_huffman_total_bytes = indexed_huffman_candidate_bytes;
+    eval.raw_deflate_total_bytes = raw_deflate_candidate_bytes;
 
     let (should_eval_circuit, circuit_rule_note) = should_evaluate_circuit(&eval);
 
@@ -680,6 +732,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         circuit_blobs.as_deref(),
         circuit_dictionary_bytes,
         huffman_stream.as_ref(),
+        Some(raw_deflate_payload.as_slice()),
     )?;
 
     fs::write(path.as_ref(), &pack_bytes)?;
@@ -693,6 +746,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
             })?;
             (0u8, hs.payload.len(), hs.symbols.len() * 2)
         }
+        PackMethod::RawDeflate => (0u8, raw_deflate_payload.len(), 0usize),
     };
 
     Ok(PackStats {
@@ -708,6 +762,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         indexed_raw_candidate_bytes,
         indexed_circuit_candidate_bytes,
         indexed_huffman_candidate_bytes,
+        raw_deflate_candidate_bytes,
         chosen_method: eval.chosen_method,
         chosen_reason: eval.chosen_reason,
         circuit_rule_note,
@@ -776,6 +831,12 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
     let dict_size = read_u64(&bytes, &mut cursor)? as usize;
     let payload_size = read_u64(&bytes, &mut cursor)? as usize;
 
+    if original_size > ZBPK_MAX_OUTPUT_BYTES {
+        return Err(ZbitError::Parse(format!(
+            "original_size exceeds safety bound ({ZBPK_MAX_OUTPUT_BYTES} bytes)"
+        )));
+    }
+
     let dict = bytes
         .get(cursor..cursor + dict_size)
         .ok_or_else(|| ZbitError::Parse("dictionary range out of bounds".to_string()))?;
@@ -806,6 +867,14 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
                 ));
             }
         }
+        PackMethod::RawDeflate => {
+            if bits_per_symbol != 0 || unique_count != 0 || dict_size != 0 {
+                return Err(ZbitError::Parse(
+                    "raw-deflate requires bits_per_symbol=0, unique_count=0, dict_size=0".to_string(),
+                ));
+            }
+            return decode_raw_deflate_payload(payload, original_size);
+        }
         PackMethod::IndexedHuffman => {
             if bits_per_symbol != 0 {
                 return Err(ZbitError::Parse(
@@ -828,7 +897,7 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
             dict.to_vec()
         }
         PackMethod::IndexedCircuit => decode_circuit_dictionary(dict, unique_count)?,
-        PackMethod::RawCopy | PackMethod::IndexedHuffman => unreachable!(),
+        PackMethod::RawCopy | PackMethod::IndexedHuffman | PackMethod::RawDeflate => unreachable!(),
     };
 
     let needed_bits = original_size * bits_per_symbol as usize;
@@ -900,5 +969,24 @@ mod tests {
             stats.indexed_huffman_candidate_bytes.is_some(),
             "huffman candidate should be evaluated for repetitive text"
         );
+    }
+
+    #[test]
+    fn adaptive_pack_can_choose_raw_deflate_and_roundtrip() {
+        let input = b"lorem ipsum dolor sit amet, consectetur adipiscing elit\\n".repeat(4000);
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("zbit_pack_deflate_{stamp}.zbpk"));
+
+        let stats = compress_adaptive_to_file(&input, &path).expect("compress adaptive");
+        let output = decompress_file(&path).expect("decompress adaptive");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(output, input);
+        assert_eq!(stats.chosen_method, PackMethod::RawDeflate);
+        assert!(stats.compressed_size <= stats.raw_candidate_bytes);
     }
 }

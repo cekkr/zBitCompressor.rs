@@ -124,6 +124,7 @@ Raw candidate size (bytes): {raw_candidate}\n\
 Indexed-raw candidate size (bytes): {indexed_raw_candidate}\n\
 Indexed-circuit candidate size (bytes): {indexed_circuit}\n\
 Indexed-huffman candidate size (bytes): {indexed_huffman}\n\
+Raw-deflate candidate size (bytes): {raw_deflate}\n\
 \n\
 Original size (bytes): {orig}\n\
 Compressed size (bytes): {comp}\n\
@@ -154,6 +155,10 @@ Output validation: {valid}\n",
             .unwrap_or_else(|| "skipped by rules".to_string()),
         indexed_huffman = stats
             .indexed_huffman_candidate_bytes
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unavailable".to_string()),
+        raw_deflate = stats
+            .raw_deflate_candidate_bytes
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unavailable".to_string()),
         orig = stats.original_size,
