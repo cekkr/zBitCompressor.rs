@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use crc32fast::Hasher as Crc32Hasher;
 use crate::error::{ZbitError, ZbitResult};
 use crate::model::ZbitModel;
 use crate::pack_rules::{choose_best_method, should_evaluate_circuit, PackEvaluation, PackMethod};
@@ -38,6 +39,7 @@ pub struct PackStats {
     pub indexed_huffman_candidate_bytes: Option<usize>,
     pub raw_deflate_candidate_bytes: Option<usize>,
     pub raw_zstd_candidate_bytes: Option<usize>,
+    pub png_idat_raw_candidate_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -64,6 +66,17 @@ struct HuffmanNode {
     symbol: Option<u8>,
     left: Option<usize>,
     right: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PngIdatStream {
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    payload: Vec<u8>,
+    base_chunk_len: u32,
+    full_chunk_count: u32,
+    tail_chunk_len: u32,
+    total_chunks: u32,
 }
 
 #[derive(Debug, Default)]
@@ -590,6 +603,220 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> ZbitResult<u64> {
     ]))
 }
 
+fn push_u32_be(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_u32_be_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn build_png_idat_stream(input: &[u8]) -> Option<PngIdatStream> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    const IDAT: &[u8; 4] = b"IDAT";
+    const IEND: &[u8; 4] = b"IEND";
+
+    if input.len() < 8 || &input[..8] != PNG_SIGNATURE {
+        return None;
+    }
+
+    let mut cursor = 8usize;
+    let mut first_idat_start: Option<usize> = None;
+    let mut last_idat_end = 0usize;
+    let mut saw_idat = false;
+    let mut closed_idat_run = false;
+
+    let mut chunk_lengths = Vec::<u32>::new();
+    let mut payload = Vec::<u8>::new();
+
+    while cursor.checked_add(12)? <= input.len() {
+        let chunk_start = cursor;
+        let chunk_len_u32 = read_u32_be_at(input, cursor)?;
+        cursor += 4;
+
+        let chunk_type = input.get(cursor..cursor + 4)?;
+        cursor += 4;
+
+        let chunk_len = chunk_len_u32 as usize;
+        let data = input.get(cursor..cursor + chunk_len)?;
+        cursor += chunk_len;
+
+        let chunk_crc = read_u32_be_at(input, cursor)?;
+        cursor += 4;
+
+        if chunk_type == IDAT {
+            if closed_idat_run {
+                return None;
+            }
+            saw_idat = true;
+            first_idat_start.get_or_insert(chunk_start);
+            chunk_lengths.push(chunk_len_u32);
+            payload.extend_from_slice(data);
+            last_idat_end = cursor;
+
+            let mut hasher = Crc32Hasher::new();
+            hasher.update(IDAT);
+            hasher.update(data);
+            if hasher.finalize() != chunk_crc {
+                return None;
+            }
+        } else if saw_idat {
+            closed_idat_run = true;
+        }
+
+        if chunk_type == IEND {
+            break;
+        }
+    }
+
+    let first_start = first_idat_start?;
+    if chunk_lengths.is_empty() || last_idat_end <= first_start {
+        return None;
+    }
+
+    let total_chunks = u32::try_from(chunk_lengths.len()).ok()?;
+    let base_chunk_len = chunk_lengths[0];
+    let mut full_chunk_count = total_chunks;
+    let mut tail_chunk_len = 0u32;
+
+    if chunk_lengths.iter().any(|&len| len != base_chunk_len) {
+        if chunk_lengths
+            .iter()
+            .take(chunk_lengths.len().saturating_sub(1))
+            .any(|&len| len != base_chunk_len)
+        {
+            return None;
+        }
+
+        full_chunk_count = total_chunks.saturating_sub(1);
+        tail_chunk_len = *chunk_lengths.last().unwrap_or(&0u32);
+    }
+
+    let prefix = input[..first_start].to_vec();
+    let suffix = input[last_idat_end..].to_vec();
+
+    Some(PngIdatStream {
+        prefix,
+        suffix,
+        payload,
+        base_chunk_len,
+        full_chunk_count,
+        tail_chunk_len,
+        total_chunks,
+    })
+}
+
+fn png_idat_dictionary_size(stream: &PngIdatStream) -> usize {
+    24usize + stream.prefix.len() + stream.suffix.len()
+}
+
+fn write_png_idat_dictionary(out: &mut Vec<u8>, stream: &PngIdatStream) {
+    push_u32(out, stream.prefix.len() as u32);
+    push_u32(out, stream.suffix.len() as u32);
+    push_u32(out, stream.base_chunk_len);
+    push_u32(out, stream.full_chunk_count);
+    push_u32(out, stream.tail_chunk_len);
+    push_u32(out, stream.total_chunks);
+    out.extend_from_slice(&stream.prefix);
+    out.extend_from_slice(&stream.suffix);
+}
+
+fn decode_png_idat_payload(dict_bytes: &[u8], payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
+    let mut dict_cursor = 0usize;
+    let prefix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let suffix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let base_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let full_chunk_count = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tail_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let total_chunks = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+
+    let prefix = dict_bytes
+        .get(dict_cursor..dict_cursor + prefix_len)
+        .ok_or_else(|| ZbitError::Parse("png-idat-raw prefix range out of bounds".to_string()))?;
+    dict_cursor += prefix_len;
+
+    let suffix = dict_bytes
+        .get(dict_cursor..dict_cursor + suffix_len)
+        .ok_or_else(|| ZbitError::Parse("png-idat-raw suffix range out of bounds".to_string()))?;
+    dict_cursor += suffix_len;
+
+    if dict_cursor != dict_bytes.len() {
+        return Err(ZbitError::Parse(
+            "trailing bytes in png-idat-raw dictionary".to_string(),
+        ));
+    }
+
+    let tail_present = if total_chunks == full_chunk_count {
+        false
+    } else if total_chunks == full_chunk_count + 1 {
+        true
+    } else {
+        return Err(ZbitError::Parse(
+            "png-idat-raw dictionary has inconsistent chunk counters".to_string(),
+        ));
+    };
+
+    let expected_payload = full_chunk_count
+        .checked_mul(base_chunk_len)
+        .and_then(|v| if tail_present { v.checked_add(tail_chunk_len) } else { Some(v) })
+        .ok_or_else(|| ZbitError::Parse("png-idat-raw payload length overflow".to_string()))?;
+
+    if payload.len() != expected_payload {
+        return Err(ZbitError::Parse(format!(
+            "png-idat-raw payload length mismatch: expected {expected_payload} got {}",
+            payload.len()
+        )));
+    }
+
+    let chunk_overhead = total_chunks
+        .checked_mul(12)
+        .ok_or_else(|| ZbitError::Parse("png-idat-raw chunk overhead overflow".to_string()))?;
+    let mut out = Vec::with_capacity(
+        prefix
+            .len()
+            .checked_add(payload.len())
+            .and_then(|v| v.checked_add(suffix.len()))
+            .and_then(|v| v.checked_add(chunk_overhead))
+            .ok_or_else(|| ZbitError::Parse("png-idat-raw output length overflow".to_string()))?,
+    );
+
+    out.extend_from_slice(prefix);
+
+    let mut payload_cursor = 0usize;
+    for idx in 0..total_chunks {
+        let chunk_len = if idx < full_chunk_count {
+            base_chunk_len
+        } else {
+            tail_chunk_len
+        };
+        let chunk_data = payload
+            .get(payload_cursor..payload_cursor + chunk_len)
+            .ok_or_else(|| ZbitError::Parse("png-idat-raw payload chunk range out of bounds".to_string()))?;
+        payload_cursor += chunk_len;
+
+        push_u32_be(&mut out, chunk_len as u32);
+        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(chunk_data);
+
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(b"IDAT");
+        hasher.update(chunk_data);
+        push_u32_be(&mut out, hasher.finalize());
+    }
+
+    out.extend_from_slice(suffix);
+
+    if out.len() != original_size {
+        return Err(ZbitError::Parse(format!(
+            "png-idat-raw output length mismatch: expected {original_size} got {}",
+            out.len()
+        )));
+    }
+
+    Ok(out)
+}
+
 fn write_pack_bytes(
     method: PackMethod,
     input: &[u8],
@@ -599,6 +826,7 @@ fn write_pack_bytes(
     huffman_stream: Option<&HuffmanStream>,
     raw_deflate_payload: Option<&[u8]>,
     raw_zstd_payload: Option<&[u8]>,
+    png_idat_stream: Option<&PngIdatStream>,
 ) -> ZbitResult<Vec<u8>> {
     if stream.unique_symbols.len() > u16::MAX as usize {
         return Err(ZbitError::Limit(
@@ -642,6 +870,12 @@ fn write_pack_bytes(
                 ZbitError::Internal("raw-zstd payload missing for raw-zstd method".to_string())
             })?;
             (0u8, 0usize, 0usize, payload.len())
+        }
+        PackMethod::PngIdatRaw => {
+            let png = png_idat_stream.ok_or_else(|| {
+                ZbitError::Internal("png-idat stream missing for png-idat-raw method".to_string())
+            })?;
+            (0u8, 0usize, png_idat_dictionary_size(png), png.payload.len())
         }
     };
 
@@ -695,6 +929,12 @@ fn write_pack_bytes(
             }
         }
         PackMethod::RawDeflate | PackMethod::RawZstd => {}
+        PackMethod::PngIdatRaw => {
+            let png = png_idat_stream.ok_or_else(|| {
+                ZbitError::Internal("png-idat stream missing for png-idat-raw dictionary".to_string())
+            })?;
+            write_png_idat_dictionary(&mut out, png);
+        }
     }
 
     match method {
@@ -718,6 +958,12 @@ fn write_pack_bytes(
             })?;
             out.extend_from_slice(&payload);
         }
+        PackMethod::PngIdatRaw => {
+            let png = png_idat_stream.ok_or_else(|| {
+                ZbitError::Internal("png-idat stream missing for png-idat-raw payload".to_string())
+            })?;
+            out.extend_from_slice(&png.payload);
+        }
     }
 
     Ok(out)
@@ -737,6 +983,10 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     let raw_deflate_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_deflate_payload.len());
     let raw_zstd_payload = build_raw_zstd_payload(input)?;
     let raw_zstd_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_zstd_payload.len());
+    let png_idat_stream = build_png_idat_stream(input);
+    let png_idat_raw_candidate_bytes = png_idat_stream
+        .as_ref()
+        .map(|png| ZBPK_HEADER_BYTES + png_idat_dictionary_size(png) + png.payload.len());
 
     let mut eval = PackEvaluation::new();
     eval.original_size = input.len();
@@ -748,6 +998,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     eval.indexed_huffman_total_bytes = indexed_huffman_candidate_bytes;
     eval.raw_deflate_total_bytes = raw_deflate_candidate_bytes;
     eval.raw_zstd_total_bytes = raw_zstd_candidate_bytes;
+    eval.png_idat_raw_total_bytes = png_idat_raw_candidate_bytes;
 
     let (should_eval_circuit, circuit_rule_note) = should_evaluate_circuit(&eval);
 
@@ -771,6 +1022,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         huffman_stream.as_ref(),
         Some(raw_deflate_payload.as_slice()),
         Some(raw_zstd_payload.as_slice()),
+        png_idat_stream.as_ref(),
     )?;
 
     fs::write(path.as_ref(), &pack_bytes)?;
@@ -786,6 +1038,12 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         }
         PackMethod::RawDeflate => (0u8, raw_deflate_payload.len(), 0usize),
         PackMethod::RawZstd => (0u8, raw_zstd_payload.len(), 0usize),
+        PackMethod::PngIdatRaw => {
+            let png = png_idat_stream.as_ref().ok_or_else(|| {
+                ZbitError::Internal("png-idat-raw selected without png stream".to_string())
+            })?;
+            (0u8, png.payload.len(), 0usize)
+        }
     };
 
     Ok(PackStats {
@@ -803,6 +1061,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         indexed_huffman_candidate_bytes,
         raw_deflate_candidate_bytes,
         raw_zstd_candidate_bytes,
+        png_idat_raw_candidate_bytes,
         chosen_method: eval.chosen_method,
         chosen_reason: eval.chosen_reason,
         circuit_rule_note,
@@ -923,6 +1182,14 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
             }
             return decode_raw_zstd_payload(payload, original_size);
         }
+        PackMethod::PngIdatRaw => {
+            if bits_per_symbol != 0 || unique_count != 0 {
+                return Err(ZbitError::Parse(
+                    "png-idat-raw requires bits_per_symbol=0 and unique_count=0".to_string(),
+                ));
+            }
+            return decode_png_idat_payload(dict, payload, original_size);
+        }
         PackMethod::IndexedHuffman => {
             if bits_per_symbol != 0 {
                 return Err(ZbitError::Parse(
@@ -945,7 +1212,11 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
             dict.to_vec()
         }
         PackMethod::IndexedCircuit => decode_circuit_dictionary(dict, unique_count)?,
-        PackMethod::RawCopy | PackMethod::IndexedHuffman | PackMethod::RawDeflate | PackMethod::RawZstd => {
+        PackMethod::RawCopy
+        | PackMethod::IndexedHuffman
+        | PackMethod::RawDeflate
+        | PackMethod::RawZstd
+        | PackMethod::PngIdatRaw => {
             unreachable!()
         }
     };
@@ -980,6 +1251,56 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn append_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+        push_u32_be(out, data.len() as u32);
+        out.extend_from_slice(chunk_type);
+        out.extend_from_slice(data);
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(chunk_type);
+        hasher.update(data);
+        push_u32_be(out, hasher.finalize());
+    }
+
+    fn build_png_with_many_idat_chunks() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&1u32.to_be_bytes()); // width
+        ihdr.extend_from_slice(&1u32.to_be_bytes()); // height
+        ihdr.push(8); // bit depth
+        ihdr.push(6); // color type RGBA
+        ihdr.push(0); // compression
+        ihdr.push(0); // filter
+        ihdr.push(0); // interlace
+        append_png_chunk(&mut out, b"IHDR", &ihdr);
+
+        let full_chunk_len = 128usize;
+        let full_chunks = 96usize;
+        let tail_chunk_len = 73usize;
+        let total_len = full_chunk_len * full_chunks + tail_chunk_len;
+
+        let mut payload = vec![0u8; total_len];
+        let mut state = 0xA5A5_1337u32;
+        for byte in &mut payload {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = (state >> 24) as u8;
+        }
+
+        let mut cursor = 0usize;
+        for _ in 0..full_chunks {
+            let slice = &payload[cursor..cursor + full_chunk_len];
+            append_png_chunk(&mut out, b"IDAT", slice);
+            cursor += full_chunk_len;
+        }
+
+        append_png_chunk(&mut out, b"IDAT", &payload[cursor..]);
+        append_png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
 
     #[test]
     fn adaptive_pack_roundtrip() {
@@ -1061,5 +1382,30 @@ mod tests {
         assert_eq!(output, input);
         assert!(stats.compressed_size <= stats.raw_candidate_bytes);
         assert!(stats.raw_zstd_candidate_bytes.is_some());
+    }
+
+    #[test]
+    fn adaptive_pack_evaluates_png_idat_raw_and_roundtrips() {
+        let input = build_png_with_many_idat_chunks();
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("zbit_pack_png_idat_{stamp}.zbpk"));
+
+        let stats = compress_adaptive_to_file(&input, &path).expect("compress adaptive");
+        let output = decompress_file(&path).expect("decompress adaptive");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(output, input);
+        let png_candidate = stats
+            .png_idat_raw_candidate_bytes
+            .expect("png-idat-raw candidate should be available");
+        assert!(
+            png_candidate < stats.raw_candidate_bytes,
+            "png-idat-raw should beat raw-copy on multi-IDAT input"
+        );
+        assert!(stats.compressed_size <= stats.raw_candidate_bytes);
     }
 }

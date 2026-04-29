@@ -9,6 +9,7 @@ pub enum PackMethod {
     IndexedHuffman,
     RawDeflate,
     RawZstd,
+    PngIdatRaw,
 }
 
 impl PackMethod {
@@ -20,6 +21,7 @@ impl PackMethod {
             Self::IndexedHuffman => 3,
             Self::RawDeflate => 4,
             Self::RawZstd => 5,
+            Self::PngIdatRaw => 6,
         }
     }
 
@@ -31,6 +33,7 @@ impl PackMethod {
             3 => Some(Self::IndexedHuffman),
             4 => Some(Self::RawDeflate),
             5 => Some(Self::RawZstd),
+            6 => Some(Self::PngIdatRaw),
             _ => None,
         }
     }
@@ -43,6 +46,7 @@ impl PackMethod {
             Self::IndexedHuffman => "indexed-huffman",
             Self::RawDeflate => "raw-deflate",
             Self::RawZstd => "raw-zstd",
+            Self::PngIdatRaw => "png-idat-raw",
         }
     }
 }
@@ -61,6 +65,7 @@ pub struct PackEvaluation {
     pub indexed_huffman_total_bytes: Option<usize>,
     pub raw_deflate_total_bytes: Option<usize>,
     pub raw_zstd_total_bytes: Option<usize>,
+    pub png_idat_raw_total_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -79,6 +84,7 @@ impl PackEvaluation {
             indexed_huffman_total_bytes: None,
             raw_deflate_total_bytes: None,
             raw_zstd_total_bytes: None,
+            png_idat_raw_total_bytes: None,
             chosen_method: PackMethod::RawCopy,
             chosen_reason: String::new(),
         }
@@ -166,6 +172,17 @@ pub fn choose_best_method(eval: &mut PackEvaluation) {
             best_reason = format!(
                 "raw-zstd improves size: {} -> {} bytes",
                 eval.raw_total_bytes, zstd_size
+            );
+        }
+    }
+
+    if let Some(png_idat_size) = eval.png_idat_raw_total_bytes {
+        if png_idat_size < best_size {
+            best_method = PackMethod::PngIdatRaw;
+            best_size = png_idat_size;
+            best_reason = format!(
+                "png-idat-raw improves size: {} -> {} bytes",
+                eval.raw_total_bytes, png_idat_size
             );
         }
     }
