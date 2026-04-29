@@ -12,6 +12,9 @@
 - License file: `LICENSE`
 
 ## Recent Updates
+- 2026-04-30: Added `raw-zstd` as a new adaptive packing candidate/method with roundtrip decode support and benchmark-candidate reporting; refreshed paper benchmark now selects `raw-zstd` with ratio `0.338176` (62015 -> 20972 bytes, validation PASS), improving over prior `raw-deflate` ratio `0.355849`.
+- 2026-04-30: Added cat challenge automation under `zbit-rs/scripts/benchmark_cat_challenge.sh` and ignored test hook `zbit-rs/tests/cat_challenge_benchmark.rs`; script downloads `assets/cat_challenge.png` only if missing and regenerates tracked report `zbit-rs/benchmark_cat_challenge_latest.txt`.
+- 2026-04-30: Updated `.gitignore` to ignore `assets/cat_challenge.png` and generated `zbit-rs/*.zbpk` artifacts.
 - 2026-04-29: Added `raw-deflate` adaptive pack method (zlib/deflate) with selection-rule integration and benchmark reporting; latest benchmark on `papers/zbit-algorithmsResearch.md` now selects `raw-deflate` with ratio `0.355849` (62015 -> 22068 bytes, validation PASS), improving over prior `indexed-huffman` ratio `0.605595`.
 - 2026-04-29: Added large-file decode safety bound in pack parser (`original_size` hard cap at 1 GiB) to prevent unbounded expansion risk during decompression.
 - 2026-04-29: Improved adaptive packing by adding `indexed-huffman` (canonical Huffman dictionary + variable-length payload) with decode support and candidate selection logic updates; refreshed benchmark now selects `indexed-huffman` and improves `papers/zbit-algorithmsResearch.md` compression from ratio `0.877433` to `0.605595` (62015 -> 37556 bytes, validation PASS).

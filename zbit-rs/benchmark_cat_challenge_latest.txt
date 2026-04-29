@@ -1,0 +1,34 @@
+zBit-rs Real File Benchmark Report
+Generated: 2026-04-29 22:42:46
+Input file: /Users/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
+Compressed artifact: /Users/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge.zbpk
+
+Selected method: raw-copy
+Selection reason: raw-copy baseline selected (2969440 bytes)
+Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
+
+Raw candidate size (bytes): 2969440
+Indexed-raw candidate size (bytes): 2969696
+Indexed-circuit candidate size (bytes): skipped by rules
+Indexed-huffman candidate size (bytes): 2969952
+Raw-deflate candidate size (bytes): 2969872
+Raw-zstd candidate size (bytes): 2969515
+
+Original size (bytes): 2969404
+Compressed size (bytes): 2969440
+Compression ratio (compressed/original): 1.000012
+Space savings (%): -0.00
+
+Compression time (ms): 2012.066
+Decompression time (ms): 4.246
+Compression throughput (MiB/s): 1.407
+Decompression throughput (MiB/s): 666.996
+
+Unique symbols: 256
+Bits per symbol index: 0
+Raw dictionary bytes: 256
+Circuit dictionary bytes: 0
+Huffman dictionary bytes: 0
+Packed index payload bytes: 2969404
+
+Output validation: PASS

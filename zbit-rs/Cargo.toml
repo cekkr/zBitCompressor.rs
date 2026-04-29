@@ -17,3 +17,4 @@ path = "src/bin/benchmark_real_file.rs"
 
 [dependencies]
 flate2 = "1.1"
+zstd = "0.13"

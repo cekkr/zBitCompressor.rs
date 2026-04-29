@@ -107,6 +107,7 @@ Implemented:
   - `indexed-circuit`
   - `indexed-huffman`
   - `raw-deflate`
+  - `raw-zstd`
 - rule-based gating for circuit-dictionary evaluation
 - size-based final method choice, never worse than raw baseline by design
 - strict `.zbpk` parser validation
@@ -177,6 +178,12 @@ cargo run --manifest-path zbit-rs/Cargo.toml --bin zbit-benchmark -- \
   zbit-rs/benchmark_latest.txt
 ```
 
+Run the cat challenge benchmark with auto-download (if missing in `assets/`):
+
+```bash
+bash zbit-rs/scripts/benchmark_cat_challenge.sh
+```
+
 ## Programmatic Usage (Library)
 
 ```rust
@@ -217,7 +224,7 @@ assert_eq!(output, input);
 - magic: `ZBPK` (`0x5A42_504B`)
 - version: `2`
 - 36-byte fixed header + dictionary + payload
-- methods: `raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`, `raw-deflate`
+- methods: `raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`, `raw-deflate`, `raw-zstd`
 
 ## References
 

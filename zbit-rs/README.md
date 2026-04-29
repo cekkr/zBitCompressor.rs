@@ -8,7 +8,7 @@ Rust migration of the `zBit` compression model with:
 - technology-aware objective mapping (ASIC area/delay and FPGA LUT4/LUT6 proxies)
 - canonical DAG interning for gates
 - model serialization/deserialization (`.zbit`)
-- adaptive pack strategy (`raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`, `raw-deflate`)
+- adaptive pack strategy (`raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`, `raw-deflate`, `raw-zstd`)
 - real-file benchmark/report generation
 
 ## Build and Test
@@ -43,3 +43,14 @@ The benchmark writes `benchmark_latest.txt` with:
 - candidate size comparison
 - compression/decompression timings and throughput
 - compression ratio and output validation result
+
+## Cat Challenge Benchmark
+
+Run the reproducible cat challenge flow (auto-downloads asset if missing):
+
+```bash
+bash scripts/benchmark_cat_challenge.sh
+```
+
+This updates:
+- `benchmark_cat_challenge_latest.txt` (tracked benchmark reference)
