@@ -6,6 +6,7 @@ pub enum PackMethod {
     RawCopy,
     IndexedRaw,
     IndexedCircuit,
+    IndexedHuffman,
 }
 
 impl PackMethod {
@@ -14,6 +15,7 @@ impl PackMethod {
             Self::RawCopy => 0,
             Self::IndexedRaw => 1,
             Self::IndexedCircuit => 2,
+            Self::IndexedHuffman => 3,
         }
     }
 
@@ -22,6 +24,7 @@ impl PackMethod {
             0 => Some(Self::RawCopy),
             1 => Some(Self::IndexedRaw),
             2 => Some(Self::IndexedCircuit),
+            3 => Some(Self::IndexedHuffman),
             _ => None,
         }
     }
@@ -31,6 +34,7 @@ impl PackMethod {
             Self::RawCopy => "raw-copy",
             Self::IndexedRaw => "indexed-raw",
             Self::IndexedCircuit => "indexed-circuit",
+            Self::IndexedHuffman => "indexed-huffman",
         }
     }
 }
@@ -46,6 +50,7 @@ pub struct PackEvaluation {
     pub indexed_raw_total_bytes: usize,
 
     pub indexed_circuit_total_bytes: Option<usize>,
+    pub indexed_huffman_total_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -61,6 +66,7 @@ impl PackEvaluation {
             raw_total_bytes: 0,
             indexed_raw_total_bytes: 0,
             indexed_circuit_total_bytes: None,
+            indexed_huffman_total_bytes: None,
             chosen_method: PackMethod::RawCopy,
             chosen_reason: String::new(),
         }
@@ -116,6 +122,17 @@ pub fn choose_best_method(eval: &mut PackEvaluation) {
             best_method = PackMethod::IndexedCircuit;
             best_size = circuit_size;
             best_reason = format!("indexed-circuit chosen after rules: {circuit_size} bytes");
+        }
+    }
+
+    if let Some(huffman_size) = eval.indexed_huffman_total_bytes {
+        if huffman_size < best_size {
+            best_method = PackMethod::IndexedHuffman;
+            best_size = huffman_size;
+            best_reason = format!(
+                "indexed-huffman improves size: {} -> {} bytes",
+                eval.raw_total_bytes, huffman_size
+            );
         }
     }
 

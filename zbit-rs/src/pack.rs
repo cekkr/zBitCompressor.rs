@@ -1,6 +1,8 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0. See LICENSE.
 // Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs;
 use std::path::Path;
 
@@ -11,6 +13,7 @@ use crate::pack_rules::{choose_best_method, should_evaluate_circuit, PackEvaluat
 pub const ZBPK_MAGIC: u32 = 0x5A42_504B; // "ZBPK"
 pub const ZBPK_VERSION: u16 = 2;
 pub const ZBPK_HEADER_BYTES: usize = 36;
+const MAX_HUFFMAN_CODE_BITS: u8 = 56;
 
 #[derive(Debug, Clone)]
 pub struct PackStats {
@@ -23,10 +26,12 @@ pub struct PackStats {
 
     pub raw_dictionary_bytes: usize,
     pub circuit_dictionary_bytes: usize,
+    pub huffman_dictionary_bytes: usize,
 
     pub raw_candidate_bytes: usize,
     pub indexed_raw_candidate_bytes: usize,
     pub indexed_circuit_candidate_bytes: Option<usize>,
+    pub indexed_huffman_candidate_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -38,6 +43,28 @@ struct IndexStream {
     unique_symbols: Vec<u8>,
     bits_per_symbol: u8,
     payload: Vec<u8>,
+    frequencies: [u32; 256],
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanStream {
+    symbols: Vec<u8>,
+    code_lengths: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanNode {
+    symbol: Option<u8>,
+    left: Option<usize>,
+    right: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct DecodeNode {
+    symbol: Option<u8>,
+    left: Option<Box<DecodeNode>>,
+    right: Option<Box<DecodeNode>>,
 }
 
 fn bits_needed_for_count(count: usize) -> u8 {
@@ -73,12 +100,41 @@ fn unpack_symbol_index(payload: &[u8], bit_offset: usize, bits: u8) -> u32 {
     value
 }
 
+fn bit_at_msb_first(payload: &[u8], bit_index: usize) -> Option<u8> {
+    let byte = *payload.get(bit_index >> 3)?;
+    let shift = 7usize.saturating_sub(bit_index & 7);
+    Some((byte >> shift) & 1)
+}
+
+fn push_bit_msb_first(out: &mut Vec<u8>, bit_index: &mut usize, bit: bool) {
+    if (*bit_index & 7) == 0 {
+        out.push(0);
+    }
+
+    if bit {
+        let byte_idx = *bit_index >> 3;
+        let shift = 7usize.saturating_sub(*bit_index & 7);
+        out[byte_idx] |= 1u8 << shift;
+    }
+
+    *bit_index += 1;
+}
+
+fn push_code_msb_first(out: &mut Vec<u8>, bit_index: &mut usize, code: u64, len: u8) {
+    for shift in (0..(len as usize)).rev() {
+        let bit = ((code >> shift) & 1) != 0;
+        push_bit_msb_first(out, bit_index, bit);
+    }
+}
+
 fn build_index_stream(input: &[u8]) -> ZbitResult<IndexStream> {
     let mut present = [false; 256];
     let mut id_map = [u16::MAX; 256];
+    let mut frequencies = [0u32; 256];
 
     for &b in input {
         present[b as usize] = true;
+        frequencies[b as usize] = frequencies[b as usize].saturating_add(1);
     }
 
     let mut unique_symbols = Vec::with_capacity(256);
@@ -110,7 +166,284 @@ fn build_index_stream(input: &[u8]) -> ZbitResult<IndexStream> {
         unique_symbols,
         bits_per_symbol: bits,
         payload,
+        frequencies,
     })
+}
+
+fn compute_huffman_lengths(symbols: &[u8], frequencies: &[u32; 256]) -> ZbitResult<Vec<u8>> {
+    if symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if symbols.len() == 1 {
+        return Ok(vec![1u8]);
+    }
+
+    let mut nodes = Vec::with_capacity(symbols.len() * 2);
+    let mut heap = BinaryHeap::<Reverse<(u64, usize, usize)>>::new();
+    let mut tie = 0usize;
+
+    for &symbol in symbols {
+        let freq = frequencies[symbol as usize] as u64;
+        nodes.push(HuffmanNode {
+            symbol: Some(symbol),
+            left: None,
+            right: None,
+        });
+        let idx = nodes.len() - 1;
+        heap.push(Reverse((freq.max(1), tie, idx)));
+        tie += 1;
+    }
+
+    while heap.len() > 1 {
+        let Reverse((f_a, _, idx_a)) = heap
+            .pop()
+            .ok_or_else(|| ZbitError::Internal("huffman heap unexpectedly empty".to_string()))?;
+        let Reverse((f_b, _, idx_b)) = heap
+            .pop()
+            .ok_or_else(|| ZbitError::Internal("huffman heap unexpectedly empty".to_string()))?;
+
+        nodes.push(HuffmanNode {
+            symbol: None,
+            left: Some(idx_a),
+            right: Some(idx_b),
+        });
+
+        let parent = nodes.len() - 1;
+        heap.push(Reverse((f_a.saturating_add(f_b), tie, parent)));
+        tie += 1;
+    }
+
+    let Reverse((_, _, root)) = heap
+        .pop()
+        .ok_or_else(|| ZbitError::Internal("huffman root missing".to_string()))?;
+
+    let mut length_by_symbol = [0u8; 256];
+    let mut stack = vec![(root, 0u8)];
+
+    while let Some((node_idx, depth)) = stack.pop() {
+        let node = nodes
+            .get(node_idx)
+            .ok_or_else(|| ZbitError::Internal("huffman node index out of range".to_string()))?;
+
+        if let Some(symbol) = node.symbol {
+            let assigned = depth.max(1);
+            length_by_symbol[symbol as usize] = assigned;
+            continue;
+        }
+
+        let next_depth = depth.saturating_add(1);
+        if let Some(left) = node.left {
+            stack.push((left, next_depth));
+        }
+        if let Some(right) = node.right {
+            stack.push((right, next_depth));
+        }
+    }
+
+    let lengths = symbols
+        .iter()
+        .map(|&symbol| length_by_symbol[symbol as usize])
+        .collect::<Vec<_>>();
+
+    Ok(lengths)
+}
+
+fn build_canonical_codes(symbols: &[u8], code_lengths: &[u8]) -> ZbitResult<Vec<(u8, u64, u8)>> {
+    if symbols.len() != code_lengths.len() {
+        return Err(ZbitError::Internal(
+            "huffman symbols and lengths length mismatch".to_string(),
+        ));
+    }
+
+    let mut entries = symbols
+        .iter()
+        .copied()
+        .zip(code_lengths.iter().copied())
+        .collect::<Vec<_>>();
+
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if entries.iter().any(|(_, len)| *len == 0) {
+        return Err(ZbitError::Internal(
+            "zero-length huffman code in non-empty dictionary".to_string(),
+        ));
+    }
+
+    if entries.iter().any(|(_, len)| *len > MAX_HUFFMAN_CODE_BITS) {
+        return Err(ZbitError::Limit(format!(
+            "huffman code length exceeds {MAX_HUFFMAN_CODE_BITS} bits"
+        )));
+    }
+
+    entries.sort_unstable_by_key(|(symbol, len)| (*len, *symbol));
+
+    let mut out = Vec::with_capacity(entries.len());
+    let mut code = 0u64;
+    let mut prev_len = entries[0].1;
+
+    out.push((entries[0].0, 0u64, prev_len));
+
+    for (symbol, len) in entries.into_iter().skip(1) {
+        if len < prev_len {
+            return Err(ZbitError::Internal(
+                "non-monotonic canonical length order".to_string(),
+            ));
+        }
+
+        let shift = (len - prev_len) as u32;
+        code = code
+            .checked_add(1)
+            .ok_or_else(|| ZbitError::Internal("canonical huffman code overflow".to_string()))?;
+        code = code
+            .checked_shl(shift)
+            .ok_or_else(|| ZbitError::Internal("canonical huffman shift overflow".to_string()))?;
+
+        out.push((symbol, code, len));
+        prev_len = len;
+    }
+
+    Ok(out)
+}
+
+fn build_huffman_stream(input: &[u8], stream: &IndexStream) -> ZbitResult<Option<HuffmanStream>> {
+    if input.is_empty() {
+        return Ok(None);
+    }
+
+    let symbols = stream.unique_symbols.clone();
+    let code_lengths = compute_huffman_lengths(&symbols, &stream.frequencies)?;
+
+    if code_lengths.iter().any(|&len| len > MAX_HUFFMAN_CODE_BITS) {
+        return Ok(None);
+    }
+
+    let codes = build_canonical_codes(&symbols, &code_lengths)?;
+
+    let mut code_by_symbol = [0u64; 256];
+    let mut len_by_symbol = [0u8; 256];
+    for (symbol, code, len) in codes {
+        code_by_symbol[symbol as usize] = code;
+        len_by_symbol[symbol as usize] = len;
+    }
+
+    let mut payload = Vec::new();
+    let mut bit_index = 0usize;
+    for &byte in input {
+        let len = len_by_symbol[byte as usize];
+        if len == 0 {
+            return Err(ZbitError::Internal(
+                "missing huffman code for input symbol".to_string(),
+            ));
+        }
+        let code = code_by_symbol[byte as usize];
+        push_code_msb_first(&mut payload, &mut bit_index, code, len);
+    }
+
+    Ok(Some(HuffmanStream {
+        symbols,
+        code_lengths,
+        payload,
+    }))
+}
+
+fn decode_huffman_dictionary(dict_bytes: &[u8], unique_count: usize) -> ZbitResult<(Vec<u8>, Vec<u8>)> {
+    if dict_bytes.len() != unique_count.saturating_mul(2) {
+        return Err(ZbitError::Parse(
+            "indexed-huffman dictionary size must be 2 * unique_count".to_string(),
+        ));
+    }
+
+    let mut symbols = Vec::with_capacity(unique_count);
+    let mut lengths = Vec::with_capacity(unique_count);
+
+    for i in 0..unique_count {
+        let symbol = dict_bytes[i * 2];
+        let len = dict_bytes[i * 2 + 1];
+
+        if len == 0 || len > MAX_HUFFMAN_CODE_BITS {
+            return Err(ZbitError::Parse(
+                "indexed-huffman dictionary contains invalid code length".to_string(),
+            ));
+        }
+
+        symbols.push(symbol);
+        lengths.push(len);
+    }
+
+    Ok((symbols, lengths))
+}
+
+fn insert_decode_code(root: &mut DecodeNode, code: u64, len: u8, symbol: u8) -> ZbitResult<()> {
+    let mut cursor = root;
+
+    for shift in (0..(len as usize)).rev() {
+        let bit = ((code >> shift) & 1) as u8;
+
+        if bit == 0 {
+            let next = cursor.left.get_or_insert_with(|| Box::<DecodeNode>::default());
+            cursor = next.as_mut();
+        } else {
+            let next = cursor.right.get_or_insert_with(|| Box::<DecodeNode>::default());
+            cursor = next.as_mut();
+        }
+    }
+
+    if cursor.symbol.replace(symbol).is_some() {
+        return Err(ZbitError::Parse(
+            "indexed-huffman dictionary assigns duplicate code".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn decode_huffman_payload(
+    payload: &[u8],
+    original_size: usize,
+    symbols: &[u8],
+    code_lengths: &[u8],
+) -> ZbitResult<Vec<u8>> {
+    let codes = build_canonical_codes(symbols, code_lengths)
+        .map_err(|e| ZbitError::Parse(format!("invalid canonical huffman dictionary: {e}")))?;
+
+    let mut root = DecodeNode::default();
+    for (symbol, code, len) in codes {
+        insert_decode_code(&mut root, code, len, symbol)?;
+    }
+
+    let mut out = vec![0u8; original_size];
+    let mut bit_index = 0usize;
+
+    for byte in out.iter_mut() {
+        let mut node = &root;
+
+        loop {
+            if let Some(symbol) = node.symbol {
+                *byte = symbol;
+                break;
+            }
+
+            let bit = bit_at_msb_first(payload, bit_index).ok_or_else(|| {
+                ZbitError::Parse("indexed-huffman payload ended before decoding output".to_string())
+            })?;
+            bit_index += 1;
+
+            node = if bit == 0 {
+                node.left
+                    .as_deref()
+                    .ok_or_else(|| ZbitError::Parse("invalid huffman prefix path".to_string()))?
+            } else {
+                node.right
+                    .as_deref()
+                    .ok_or_else(|| ZbitError::Parse("invalid huffman prefix path".to_string()))?
+            };
+        }
+    }
+
+    Ok(out)
 }
 
 fn model_blob_for_symbol(symbol: u8) -> ZbitResult<Vec<u8>> {
@@ -207,6 +540,7 @@ fn write_pack_bytes(
     stream: &IndexStream,
     circuit_blobs: Option<&[Vec<u8>]>,
     circuit_dict_bytes: usize,
+    huffman_stream: Option<&HuffmanStream>,
 ) -> ZbitResult<Vec<u8>> {
     if stream.unique_symbols.len() > u16::MAX as usize {
         return Err(ZbitError::Limit(
@@ -228,6 +562,17 @@ fn write_pack_bytes(
             circuit_dict_bytes,
             stream.payload.len(),
         ),
+        PackMethod::IndexedHuffman => {
+            let hs = huffman_stream.ok_or_else(|| {
+                ZbitError::Internal("huffman stream missing for indexed-huffman method".to_string())
+            })?;
+            (
+                0u8,
+                hs.symbols.len(),
+                hs.symbols.len() * 2,
+                hs.payload.len(),
+            )
+        }
     };
 
     let mut out = Vec::with_capacity(ZBPK_HEADER_BYTES + dict_size + payload_size);
@@ -263,11 +608,33 @@ fn write_pack_bytes(
                 out.extend_from_slice(blob);
             }
         }
+        PackMethod::IndexedHuffman => {
+            let hs = huffman_stream.ok_or_else(|| {
+                ZbitError::Internal("huffman stream missing for indexed-huffman dictionary".to_string())
+            })?;
+
+            if hs.symbols.len() != hs.code_lengths.len() {
+                return Err(ZbitError::Internal(
+                    "huffman dictionary symbol/length mismatch".to_string(),
+                ));
+            }
+
+            for (&symbol, &len) in hs.symbols.iter().zip(hs.code_lengths.iter()) {
+                out.push(symbol);
+                out.push(len);
+            }
+        }
     }
 
     match method {
         PackMethod::RawCopy => out.extend_from_slice(input),
         PackMethod::IndexedRaw | PackMethod::IndexedCircuit => out.extend_from_slice(&stream.payload),
+        PackMethod::IndexedHuffman => {
+            let hs = huffman_stream.ok_or_else(|| {
+                ZbitError::Internal("huffman stream missing for indexed-huffman payload".to_string())
+            })?;
+            out.extend_from_slice(&hs.payload);
+        }
     }
 
     Ok(out)
@@ -279,6 +646,11 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     let raw_candidate_bytes = ZBPK_HEADER_BYTES + input.len();
     let indexed_raw_candidate_bytes = ZBPK_HEADER_BYTES + stream.unique_symbols.len() + stream.payload.len();
 
+    let huffman_stream = build_huffman_stream(input, &stream)?;
+    let indexed_huffman_candidate_bytes = huffman_stream
+        .as_ref()
+        .map(|hs| ZBPK_HEADER_BYTES + hs.symbols.len() * 2 + hs.payload.len());
+
     let mut eval = PackEvaluation::new();
     eval.original_size = input.len();
     eval.symbol_bits = 8;
@@ -286,6 +658,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     eval.payload_bytes = stream.payload.len();
     eval.raw_total_bytes = raw_candidate_bytes;
     eval.indexed_raw_total_bytes = indexed_raw_candidate_bytes;
+    eval.indexed_huffman_total_bytes = indexed_huffman_candidate_bytes;
 
     let (should_eval_circuit, circuit_rule_note) = should_evaluate_circuit(&eval);
 
@@ -306,21 +679,35 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         &stream,
         circuit_blobs.as_deref(),
         circuit_dictionary_bytes,
+        huffman_stream.as_ref(),
     )?;
 
     fs::write(path.as_ref(), &pack_bytes)?;
+
+    let (bits_per_symbol, payload_bytes, huffman_dictionary_bytes) = match eval.chosen_method {
+        PackMethod::RawCopy => (0u8, input.len(), 0usize),
+        PackMethod::IndexedRaw | PackMethod::IndexedCircuit => (stream.bits_per_symbol, stream.payload.len(), 0usize),
+        PackMethod::IndexedHuffman => {
+            let hs = huffman_stream.as_ref().ok_or_else(|| {
+                ZbitError::Internal("indexed-huffman selected without huffman stream".to_string())
+            })?;
+            (0u8, hs.payload.len(), hs.symbols.len() * 2)
+        }
+    };
 
     Ok(PackStats {
         original_size: input.len(),
         compressed_size: pack_bytes.len(),
         unique_symbols: stream.unique_symbols.len(),
-        bits_per_symbol: stream.bits_per_symbol,
-        payload_bytes: stream.payload.len(),
+        bits_per_symbol,
+        payload_bytes,
         raw_dictionary_bytes: stream.unique_symbols.len(),
         circuit_dictionary_bytes,
+        huffman_dictionary_bytes,
         raw_candidate_bytes,
         indexed_raw_candidate_bytes,
         indexed_circuit_candidate_bytes,
+        indexed_huffman_candidate_bytes,
         chosen_method: eval.chosen_method,
         chosen_reason: eval.chosen_reason,
         circuit_rule_note,
@@ -419,6 +806,16 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
                 ));
             }
         }
+        PackMethod::IndexedHuffman => {
+            if bits_per_symbol != 0 {
+                return Err(ZbitError::Parse(
+                    "indexed-huffman requires bits_per_symbol == 0".to_string(),
+                ));
+            }
+
+            let (symbols, lengths) = decode_huffman_dictionary(dict, unique_count)?;
+            return decode_huffman_payload(payload, original_size, &symbols, &lengths);
+        }
     }
 
     let symbol_by_id = match method {
@@ -431,7 +828,7 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
             dict.to_vec()
         }
         PackMethod::IndexedCircuit => decode_circuit_dictionary(dict, unique_count)?,
-        PackMethod::RawCopy => unreachable!(),
+        PackMethod::RawCopy | PackMethod::IndexedHuffman => unreachable!(),
     };
 
     let needed_bits = original_size * bits_per_symbol as usize;
@@ -481,5 +878,27 @@ mod tests {
 
         assert_eq!(output, input);
         assert!(stats.compressed_size <= stats.raw_candidate_bytes);
+    }
+
+    #[test]
+    fn adaptive_pack_can_choose_huffman_and_roundtrip() {
+        let input = b"the quick brown fox jumps over the lazy dog\n".repeat(2000);
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("zbit_pack_huffman_{stamp}.zbpk"));
+
+        let stats = compress_adaptive_to_file(&input, &path).expect("compress adaptive");
+        let output = decompress_file(&path).expect("decompress adaptive");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(output, input);
+        assert!(stats.compressed_size <= stats.raw_candidate_bytes);
+        assert!(
+            stats.indexed_huffman_candidate_bytes.is_some(),
+            "huffman candidate should be evaluated for repetitive text"
+        );
     }
 }

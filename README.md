@@ -105,6 +105,7 @@ Implemented:
   - `raw-copy`
   - `indexed-raw`
   - `indexed-circuit`
+  - `indexed-huffman`
 - rule-based gating for circuit-dictionary evaluation
 - size-based final method choice, never worse than raw baseline by design
 - strict `.zbpk` parser validation
@@ -215,7 +216,7 @@ assert_eq!(output, input);
 - magic: `ZBPK` (`0x5A42_504B`)
 - version: `2`
 - 36-byte fixed header + dictionary + payload
-- methods: `raw-copy`, `indexed-raw`, `indexed-circuit`
+- methods: `raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`
 
 ## References
 

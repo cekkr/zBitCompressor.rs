@@ -123,6 +123,7 @@ Circuit evaluation rule: {rule}\n\
 Raw candidate size (bytes): {raw_candidate}\n\
 Indexed-raw candidate size (bytes): {indexed_raw_candidate}\n\
 Indexed-circuit candidate size (bytes): {indexed_circuit}\n\
+Indexed-huffman candidate size (bytes): {indexed_huffman}\n\
 \n\
 Original size (bytes): {orig}\n\
 Compressed size (bytes): {comp}\n\
@@ -138,6 +139,7 @@ Unique symbols: {unique}\n\
 Bits per symbol index: {bits}\n\
 Raw dictionary bytes: {raw_dict}\n\
 Circuit dictionary bytes: {circuit_dict}\n\
+Huffman dictionary bytes: {huffman_dict}\n\
 Packed index payload bytes: {payload}\n\
 \n\
 Output validation: {valid}\n",
@@ -150,6 +152,10 @@ Output validation: {valid}\n",
             .indexed_circuit_candidate_bytes
             .map(|v| v.to_string())
             .unwrap_or_else(|| "skipped by rules".to_string()),
+        indexed_huffman = stats
+            .indexed_huffman_candidate_bytes
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unavailable".to_string()),
         orig = stats.original_size,
         comp = stats.compressed_size,
         ratio = ratio,
@@ -162,6 +168,7 @@ Output validation: {valid}\n",
         bits = stats.bits_per_symbol,
         raw_dict = stats.raw_dictionary_bytes,
         circuit_dict = stats.circuit_dictionary_bytes,
+        huffman_dict = stats.huffman_dictionary_bytes,
         payload = stats.payload_bytes,
         valid = if output_valid { "PASS" } else { "FAIL" },
     );
