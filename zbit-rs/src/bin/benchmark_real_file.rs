@@ -127,6 +127,7 @@ Indexed-huffman candidate size (bytes): {indexed_huffman}\n\
 Raw-deflate candidate size (bytes): {raw_deflate}\n\
 Raw-zstd candidate size (bytes): {raw_zstd}\n\
 Png-idat-raw candidate size (bytes): {png_idat_raw}\n\
+Png-preflate-xz candidate size (bytes): {png_preflate_xz}\n\
 \n\
 Original size (bytes): {orig}\n\
 Compressed size (bytes): {comp}\n\
@@ -169,6 +170,10 @@ Output validation: {valid}\n",
             .unwrap_or_else(|| "unavailable".to_string()),
         png_idat_raw = stats
             .png_idat_raw_candidate_bytes
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unavailable".to_string()),
+        png_preflate_xz = stats
+            .png_preflate_xz_candidate_bytes
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unavailable".to_string()),
         orig = stats.original_size,

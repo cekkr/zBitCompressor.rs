@@ -4,7 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use crc32fast::Hasher as Crc32Hasher;
@@ -12,6 +12,8 @@ use crate::error::{ZbitError, ZbitResult};
 use crate::model::ZbitModel;
 use crate::pack_rules::{choose_best_method, should_evaluate_circuit, PackEvaluation, PackMethod};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use preflate_rs::{preflate_whole_deflate_stream, recreate_whole_deflate_stream, PreflateConfig};
+use xz2::read::{XzDecoder, XzEncoder};
 use zstd::stream as zstd_stream;
 
 pub const ZBPK_MAGIC: u32 = 0x5A42_504B; // "ZBPK"
@@ -40,6 +42,7 @@ pub struct PackStats {
     pub raw_deflate_candidate_bytes: Option<usize>,
     pub raw_zstd_candidate_bytes: Option<usize>,
     pub png_idat_raw_candidate_bytes: Option<usize>,
+    pub png_preflate_xz_candidate_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -77,6 +80,29 @@ struct PngIdatStream {
     full_chunk_count: u32,
     tail_chunk_len: u32,
     total_chunks: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PngIhdrInfo {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+    compression_method: u8,
+    filter_method: u8,
+    interlace_method: u8,
+}
+
+#[derive(Debug, Clone)]
+struct PngPreflateStream {
+    base: PngIdatStream,
+    transformed_payload: Vec<u8>,
+    corrections: Vec<u8>,
+    transformed_len: usize,
+    correction_len: usize,
+    zlib_header: [u8; 2],
+    zlib_adler32: [u8; 4],
+    ihdr: PngIhdrInfo,
 }
 
 #[derive(Debug, Default)]
@@ -817,6 +843,387 @@ fn decode_png_idat_payload(dict_bytes: &[u8], payload: &[u8], original_size: usi
     Ok(out)
 }
 
+fn parse_png_ihdr_rgba8(input: &[u8]) -> Option<PngIhdrInfo> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if input.len() < 8 || &input[..8] != PNG_SIGNATURE {
+        return None;
+    }
+
+    let mut cursor = 8usize;
+    while cursor.checked_add(12)? <= input.len() {
+        let chunk_len = read_u32_be_at(input, cursor)? as usize;
+        cursor += 4;
+        let chunk_type = input.get(cursor..cursor + 4)?;
+        cursor += 4;
+        let data = input.get(cursor..cursor + chunk_len)?;
+        cursor += chunk_len;
+        cursor = cursor.checked_add(4)?; // CRC
+
+        if chunk_type == b"IHDR" {
+            if data.len() != 13 {
+                return None;
+            }
+            let width = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+            let height = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+            let ihdr = PngIhdrInfo {
+                width,
+                height,
+                bit_depth: data[8],
+                color_type: data[9],
+                compression_method: data[10],
+                filter_method: data[11],
+                interlace_method: data[12],
+            };
+
+            if ihdr.width == 0 || ihdr.height == 0 {
+                return None;
+            }
+            if ihdr.bit_depth != 8
+                || ihdr.color_type != 6
+                || ihdr.compression_method != 0
+                || ihdr.filter_method != 0
+                || ihdr.interlace_method > 1
+            {
+                return None;
+            }
+            return Some(ihdr);
+        }
+
+        if chunk_type == b"IEND" {
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
+    let a = a as i32;
+    let b = b as i32;
+    let c = c as i32;
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
+    }
+}
+
+fn rgba8_row_bytes(ihdr: PngIhdrInfo) -> Option<usize> {
+    (ihdr.width as usize).checked_mul(4)
+}
+
+fn build_png_preflate_transform(filtered_plain: &[u8], ihdr: PngIhdrInfo) -> Option<Vec<u8>> {
+    let row_bytes = rgba8_row_bytes(ihdr)?;
+    let row_stride = row_bytes.checked_add(1)?;
+    let rows = ihdr.height as usize;
+    let expected_len = row_stride.checked_mul(rows)?;
+    if filtered_plain.len() != expected_len {
+        return None;
+    }
+
+    let mut filters = Vec::with_capacity(rows);
+    let mut payload = Vec::with_capacity(row_bytes.checked_mul(rows)?);
+
+    for row_idx in 0..rows {
+        let start = row_idx * row_stride;
+        let filter = *filtered_plain.get(start)?;
+        filters.push(filter);
+        let encoded = filtered_plain.get(start + 1..start + 1 + row_bytes)?;
+        payload.extend_from_slice(encoded);
+    }
+
+    let mut out = Vec::with_capacity(filters.len().checked_add(payload.len())?);
+    out.extend_from_slice(&filters);
+    out.extend_from_slice(&payload);
+    Some(out)
+}
+
+fn decode_png_preflate_transform(transform: &[u8], ihdr: PngIhdrInfo) -> Option<Vec<u8>> {
+    let row_bytes = rgba8_row_bytes(ihdr)?;
+    let rows = ihdr.height as usize;
+    let filters_len = rows;
+    let pixels_len = row_bytes.checked_mul(rows)?;
+    let expected_len = filters_len.checked_add(pixels_len)?;
+    if transform.len() != expected_len {
+        return None;
+    }
+
+    let filters = &transform[..filters_len];
+    let payload = &transform[filters_len..];
+    let row_stride = row_bytes.checked_add(1)?;
+    let mut out = Vec::with_capacity(row_stride.checked_mul(rows)?);
+
+    for row_idx in 0..rows {
+        out.push(filters[row_idx]);
+        let row_payload = payload.get(row_idx * row_bytes..(row_idx + 1) * row_bytes)?;
+        out.extend_from_slice(row_payload);
+    }
+
+    Some(out)
+}
+
+fn xz_encode_best(data: &[u8]) -> ZbitResult<Vec<u8>> {
+    let mut encoder = XzEncoder::new(Cursor::new(data), 9);
+    let mut out = Vec::new();
+    encoder
+        .read_to_end(&mut out)
+        .map_err(|e| ZbitError::Io(format!("xz encode failed: {e}")))?;
+    Ok(out)
+}
+
+fn xz_decode_all(data: &[u8]) -> ZbitResult<Vec<u8>> {
+    let mut decoder = XzDecoder::new(Cursor::new(data));
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| ZbitError::Parse(format!("xz decode failed: {e}")))?;
+    Ok(out)
+}
+
+fn build_png_preflate_stream(input: &[u8], base: &PngIdatStream) -> ZbitResult<Option<PngPreflateStream>> {
+    let ihdr = match parse_png_ihdr_rgba8(input) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    if base.payload.len() < 6 {
+        return Ok(None);
+    }
+
+    let mut zlib_header = [0u8; 2];
+    zlib_header.copy_from_slice(&base.payload[..2]);
+    let mut zlib_adler32 = [0u8; 4];
+    zlib_adler32.copy_from_slice(&base.payload[base.payload.len() - 4..]);
+    let deflate_stream = &base.payload[2..base.payload.len() - 4];
+
+    let mut config = PreflateConfig::default();
+    config.verify_compression = true;
+    config.plain_text_limit = ZBPK_MAX_OUTPUT_BYTES;
+
+    let (chunk, plain) = match preflate_whole_deflate_stream(deflate_stream, &config) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    let transformed = match build_png_preflate_transform(plain.text(), ihdr) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let transformed_payload = xz_encode_best(&transformed)?;
+    let corrections = chunk.corrections;
+    let transformed_len = transformed_payload.len();
+    let correction_len = corrections.len();
+
+    Ok(Some(PngPreflateStream {
+        base: base.clone(),
+        transformed_payload,
+        corrections,
+        transformed_len,
+        correction_len,
+        zlib_header,
+        zlib_adler32,
+        ihdr,
+    }))
+}
+
+fn png_preflate_dictionary_size(stream: &PngPreflateStream) -> usize {
+    png_idat_dictionary_size(&stream.base) + 35
+}
+
+fn write_png_preflate_dictionary(out: &mut Vec<u8>, stream: &PngPreflateStream) {
+    write_png_idat_dictionary(out, &stream.base);
+    out.extend_from_slice(&stream.zlib_header);
+    out.extend_from_slice(&stream.zlib_adler32);
+    push_u64(out, stream.transformed_len as u64);
+    push_u64(out, stream.correction_len as u64);
+    push_u32(out, stream.ihdr.width);
+    push_u32(out, stream.ihdr.height);
+    out.push(stream.ihdr.bit_depth);
+    out.push(stream.ihdr.color_type);
+    out.push(stream.ihdr.compression_method);
+    out.push(stream.ihdr.filter_method);
+    out.push(stream.ihdr.interlace_method);
+}
+
+fn decode_png_preflate_payload(
+    dict_bytes: &[u8],
+    payload: &[u8],
+    original_size: usize,
+) -> ZbitResult<Vec<u8>> {
+    let mut dict_cursor = 0usize;
+    let prefix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let suffix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let base_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let full_chunk_count = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tail_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let total_chunks = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+
+    let prefix = dict_bytes
+        .get(dict_cursor..dict_cursor + prefix_len)
+        .ok_or_else(|| ZbitError::Parse("png-preflate-xz prefix range out of bounds".to_string()))?;
+    dict_cursor += prefix_len;
+
+    let suffix = dict_bytes
+        .get(dict_cursor..dict_cursor + suffix_len)
+        .ok_or_else(|| ZbitError::Parse("png-preflate-xz suffix range out of bounds".to_string()))?;
+    dict_cursor += suffix_len;
+
+    let zlib_header_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 2)
+        .ok_or_else(|| ZbitError::Parse("png-preflate-xz missing zlib header".to_string()))?;
+    dict_cursor += 2;
+    let mut zlib_header = [0u8; 2];
+    zlib_header.copy_from_slice(zlib_header_slice);
+
+    let zlib_adler_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 4)
+        .ok_or_else(|| ZbitError::Parse("png-preflate-xz missing zlib adler32".to_string()))?;
+    dict_cursor += 4;
+    let mut zlib_adler32 = [0u8; 4];
+    zlib_adler32.copy_from_slice(zlib_adler_slice);
+
+    let transformed_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let correction_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let width = read_u32(dict_bytes, &mut dict_cursor)?;
+    let height = read_u32(dict_bytes, &mut dict_cursor)?;
+    let bit_depth = read_u8(dict_bytes, &mut dict_cursor)?;
+    let color_type = read_u8(dict_bytes, &mut dict_cursor)?;
+    let compression_method = read_u8(dict_bytes, &mut dict_cursor)?;
+    let filter_method = read_u8(dict_bytes, &mut dict_cursor)?;
+    let interlace_method = read_u8(dict_bytes, &mut dict_cursor)?;
+
+    if dict_cursor != dict_bytes.len() {
+        return Err(ZbitError::Parse(
+            "trailing bytes in png-preflate-xz dictionary".to_string(),
+        ));
+    }
+
+    let ihdr = PngIhdrInfo {
+        width,
+        height,
+        bit_depth,
+        color_type,
+        compression_method,
+        filter_method,
+        interlace_method,
+    };
+
+    if ihdr.bit_depth != 8
+        || ihdr.color_type != 6
+        || ihdr.compression_method != 0
+        || ihdr.filter_method != 0
+        || ihdr.interlace_method > 1
+    {
+        return Err(ZbitError::Parse(
+            "png-preflate-xz dictionary contains unsupported IHDR profile".to_string(),
+        ));
+    }
+
+    let expected_payload = transformed_len
+        .checked_add(correction_len)
+        .ok_or_else(|| ZbitError::Parse("png-preflate-xz payload length overflow".to_string()))?;
+    if payload.len() != expected_payload {
+        return Err(ZbitError::Parse(format!(
+            "png-preflate-xz payload length mismatch: expected {expected_payload} got {}",
+            payload.len()
+        )));
+    }
+
+    let transformed_payload = &payload[..transformed_len];
+    let corrections = &payload[transformed_len..];
+    let transformed = xz_decode_all(transformed_payload)?;
+    let filtered_plain = decode_png_preflate_transform(&transformed, ihdr).ok_or_else(|| {
+        ZbitError::Parse("png-preflate-xz transformed stream is invalid".to_string())
+    })?;
+
+    let deflate_stream = recreate_whole_deflate_stream(&filtered_plain, corrections)
+        .map_err(|e| ZbitError::Parse(format!("preflate recreate failed: {e}")))?;
+
+    let mut idat_payload = Vec::with_capacity(
+        2usize
+            .checked_add(deflate_stream.len())
+            .and_then(|v| v.checked_add(4))
+            .ok_or_else(|| ZbitError::Parse("png-preflate-xz idat payload overflow".to_string()))?,
+    );
+    idat_payload.extend_from_slice(&zlib_header);
+    idat_payload.extend_from_slice(&deflate_stream);
+    idat_payload.extend_from_slice(&zlib_adler32);
+
+    let tail_present = if total_chunks == full_chunk_count {
+        false
+    } else if total_chunks == full_chunk_count + 1 {
+        true
+    } else {
+        return Err(ZbitError::Parse(
+            "png-preflate-xz dictionary has inconsistent chunk counters".to_string(),
+        ));
+    };
+
+    let expected_idat_payload = full_chunk_count
+        .checked_mul(base_chunk_len)
+        .and_then(|v| if tail_present { v.checked_add(tail_chunk_len) } else { Some(v) })
+        .ok_or_else(|| ZbitError::Parse("png-preflate-xz idat length overflow".to_string()))?;
+    if idat_payload.len() != expected_idat_payload {
+        return Err(ZbitError::Parse(format!(
+            "png-preflate-xz idat length mismatch: expected {expected_idat_payload} got {}",
+            idat_payload.len()
+        )));
+    }
+
+    let chunk_overhead = total_chunks
+        .checked_mul(12)
+        .ok_or_else(|| ZbitError::Parse("png-preflate-xz chunk overhead overflow".to_string()))?;
+    let mut out = Vec::with_capacity(
+        prefix
+            .len()
+            .checked_add(idat_payload.len())
+            .and_then(|v| v.checked_add(suffix.len()))
+            .and_then(|v| v.checked_add(chunk_overhead))
+            .ok_or_else(|| ZbitError::Parse("png-preflate-xz output length overflow".to_string()))?,
+    );
+    out.extend_from_slice(prefix);
+
+    let mut payload_cursor = 0usize;
+    for idx in 0..total_chunks {
+        let chunk_len = if idx < full_chunk_count {
+            base_chunk_len
+        } else {
+            tail_chunk_len
+        };
+        let chunk_data = idat_payload
+            .get(payload_cursor..payload_cursor + chunk_len)
+            .ok_or_else(|| ZbitError::Parse("png-preflate-xz idat range out of bounds".to_string()))?;
+        payload_cursor += chunk_len;
+
+        push_u32_be(&mut out, chunk_len as u32);
+        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(chunk_data);
+
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(b"IDAT");
+        hasher.update(chunk_data);
+        push_u32_be(&mut out, hasher.finalize());
+    }
+
+    out.extend_from_slice(suffix);
+
+    if out.len() != original_size {
+        return Err(ZbitError::Parse(format!(
+            "png-preflate-xz output length mismatch: expected {original_size} got {}",
+            out.len()
+        )));
+    }
+
+    Ok(out)
+}
+
 fn write_pack_bytes(
     method: PackMethod,
     input: &[u8],
@@ -827,6 +1234,7 @@ fn write_pack_bytes(
     raw_deflate_payload: Option<&[u8]>,
     raw_zstd_payload: Option<&[u8]>,
     png_idat_stream: Option<&PngIdatStream>,
+    png_preflate_stream: Option<&PngPreflateStream>,
 ) -> ZbitResult<Vec<u8>> {
     if stream.unique_symbols.len() > u16::MAX as usize {
         return Err(ZbitError::Limit(
@@ -876,6 +1284,17 @@ fn write_pack_bytes(
                 ZbitError::Internal("png-idat stream missing for png-idat-raw method".to_string())
             })?;
             (0u8, 0usize, png_idat_dictionary_size(png), png.payload.len())
+        }
+        PackMethod::PngPreflateXz => {
+            let png = png_preflate_stream.ok_or_else(|| {
+                ZbitError::Internal("png-preflate stream missing for png-preflate-xz method".to_string())
+            })?;
+            (
+                0u8,
+                0usize,
+                png_preflate_dictionary_size(png),
+                png.transformed_len + png.correction_len,
+            )
         }
     };
 
@@ -935,6 +1354,12 @@ fn write_pack_bytes(
             })?;
             write_png_idat_dictionary(&mut out, png);
         }
+        PackMethod::PngPreflateXz => {
+            let png = png_preflate_stream.ok_or_else(|| {
+                ZbitError::Internal("png-preflate stream missing for png-preflate-xz dictionary".to_string())
+            })?;
+            write_png_preflate_dictionary(&mut out, png);
+        }
     }
 
     match method {
@@ -964,6 +1389,13 @@ fn write_pack_bytes(
             })?;
             out.extend_from_slice(&png.payload);
         }
+        PackMethod::PngPreflateXz => {
+            let png = png_preflate_stream.ok_or_else(|| {
+                ZbitError::Internal("png-preflate stream missing for png-preflate-xz payload".to_string())
+            })?;
+            out.extend_from_slice(&png.transformed_payload);
+            out.extend_from_slice(&png.corrections);
+        }
     }
 
     Ok(out)
@@ -987,6 +1419,13 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     let png_idat_raw_candidate_bytes = png_idat_stream
         .as_ref()
         .map(|png| ZBPK_HEADER_BYTES + png_idat_dictionary_size(png) + png.payload.len());
+    let png_preflate_stream = match png_idat_stream.as_ref() {
+        Some(png) => build_png_preflate_stream(input, png)?,
+        None => None,
+    };
+    let png_preflate_xz_candidate_bytes = png_preflate_stream
+        .as_ref()
+        .map(|png| ZBPK_HEADER_BYTES + png_preflate_dictionary_size(png) + png.transformed_len + png.correction_len);
 
     let mut eval = PackEvaluation::new();
     eval.original_size = input.len();
@@ -999,6 +1438,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     eval.raw_deflate_total_bytes = raw_deflate_candidate_bytes;
     eval.raw_zstd_total_bytes = raw_zstd_candidate_bytes;
     eval.png_idat_raw_total_bytes = png_idat_raw_candidate_bytes;
+    eval.png_preflate_xz_total_bytes = png_preflate_xz_candidate_bytes;
 
     let (should_eval_circuit, circuit_rule_note) = should_evaluate_circuit(&eval);
 
@@ -1023,6 +1463,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         Some(raw_deflate_payload.as_slice()),
         Some(raw_zstd_payload.as_slice()),
         png_idat_stream.as_ref(),
+        png_preflate_stream.as_ref(),
     )?;
 
     fs::write(path.as_ref(), &pack_bytes)?;
@@ -1044,6 +1485,12 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
             })?;
             (0u8, png.payload.len(), 0usize)
         }
+        PackMethod::PngPreflateXz => {
+            let png = png_preflate_stream.as_ref().ok_or_else(|| {
+                ZbitError::Internal("png-preflate-xz selected without png-preflate stream".to_string())
+            })?;
+            (0u8, png.transformed_len + png.correction_len, 0usize)
+        }
     };
 
     Ok(PackStats {
@@ -1062,6 +1509,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         raw_deflate_candidate_bytes,
         raw_zstd_candidate_bytes,
         png_idat_raw_candidate_bytes,
+        png_preflate_xz_candidate_bytes,
         chosen_method: eval.chosen_method,
         chosen_reason: eval.chosen_reason,
         circuit_rule_note,
@@ -1190,6 +1638,14 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
             }
             return decode_png_idat_payload(dict, payload, original_size);
         }
+        PackMethod::PngPreflateXz => {
+            if bits_per_symbol != 0 || unique_count != 0 {
+                return Err(ZbitError::Parse(
+                    "png-preflate-xz requires bits_per_symbol=0 and unique_count=0".to_string(),
+                ));
+            }
+            return decode_png_preflate_payload(dict, payload, original_size);
+        }
         PackMethod::IndexedHuffman => {
             if bits_per_symbol != 0 {
                 return Err(ZbitError::Parse(
@@ -1216,7 +1672,8 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
         | PackMethod::IndexedHuffman
         | PackMethod::RawDeflate
         | PackMethod::RawZstd
-        | PackMethod::PngIdatRaw => {
+        | PackMethod::PngIdatRaw
+        | PackMethod::PngPreflateXz => {
             unreachable!()
         }
     };
@@ -1300,6 +1757,92 @@ mod tests {
         append_png_chunk(&mut out, b"IDAT", &payload[cursor..]);
         append_png_chunk(&mut out, b"IEND", &[]);
         out
+    }
+
+    fn build_valid_png_with_split_idat() -> (Vec<u8>, Vec<u8>, PngIhdrInfo) {
+        let width = 64u32;
+        let height = 64u32;
+        let ihdr_info = PngIhdrInfo {
+            width,
+            height,
+            bit_depth: 8,
+            color_type: 6,
+            compression_method: 0,
+            filter_method: 0,
+            interlace_method: 0,
+        };
+
+        let row_bytes = (width as usize) * 4;
+        let mut filtered = Vec::with_capacity((row_bytes + 1) * (height as usize));
+        let mut prev_raw = vec![0u8; row_bytes];
+
+        for y in 0..height as usize {
+            let filter = (y % 5) as u8;
+            filtered.push(filter);
+
+            let mut raw_row = vec![0u8; row_bytes];
+            for x in 0..width as usize {
+                let idx = x * 4;
+                raw_row[idx] = ((x * 3 + y * 5) & 0xFF) as u8;
+                raw_row[idx + 1] = ((x * 7 + y * 11) & 0xFF) as u8;
+                raw_row[idx + 2] = ((x * 13 + y * 17) & 0xFF) as u8;
+                raw_row[idx + 3] = 255u8;
+            }
+
+            for i in 0..row_bytes {
+                let encoded = match filter {
+                    0 => raw_row[i],
+                    1 => {
+                        let left = if i >= 4 { raw_row[i - 4] } else { 0 };
+                        raw_row[i].wrapping_sub(left)
+                    }
+                    2 => raw_row[i].wrapping_sub(prev_raw[i]),
+                    3 => {
+                        let left = if i >= 4 { raw_row[i - 4] } else { 0 };
+                        let up = prev_raw[i];
+                        raw_row[i].wrapping_sub(((left as u16 + up as u16) / 2) as u8)
+                    }
+                    4 => {
+                        let left = if i >= 4 { raw_row[i - 4] } else { 0 };
+                        let up = prev_raw[i];
+                        let up_left = if i >= 4 { prev_raw[i - 4] } else { 0 };
+                        raw_row[i].wrapping_sub(paeth_predictor(left, up, up_left))
+                    }
+                    _ => unreachable!(),
+                };
+                filtered.push(encoded);
+            }
+
+            prev_raw.copy_from_slice(&raw_row);
+        }
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&filtered).expect("zlib write");
+        let idat_payload = encoder.finish().expect("zlib finish");
+
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.push(8);
+        ihdr.push(6);
+        ihdr.push(0);
+        ihdr.push(0);
+        ihdr.push(0);
+        append_png_chunk(&mut png, b"IHDR", &ihdr);
+
+        let chunk = 1024usize;
+        let mut cursor = 0usize;
+        while cursor < idat_payload.len() {
+            let end = (cursor + chunk).min(idat_payload.len());
+            append_png_chunk(&mut png, b"IDAT", &idat_payload[cursor..end]);
+            cursor = end;
+        }
+
+        append_png_chunk(&mut png, b"IEND", &[]);
+        (png, filtered, ihdr_info)
     }
 
     #[test]
@@ -1405,6 +1948,36 @@ mod tests {
         assert!(
             png_candidate < stats.raw_candidate_bytes,
             "png-idat-raw should beat raw-copy on multi-IDAT input"
+        );
+        assert!(stats.compressed_size <= stats.raw_candidate_bytes);
+    }
+
+    #[test]
+    fn png_preflate_transform_roundtrip() {
+        let (_png, filtered_plain, ihdr) = build_valid_png_with_split_idat();
+        let transformed = build_png_preflate_transform(&filtered_plain, ihdr).expect("build transform");
+        let decoded = decode_png_preflate_transform(&transformed, ihdr).expect("decode transform");
+        assert_eq!(decoded, filtered_plain);
+    }
+
+    #[test]
+    fn adaptive_pack_evaluates_png_preflate_xz_candidate_and_roundtrips() {
+        let (input, _filtered_plain, _ihdr) = build_valid_png_with_split_idat();
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("zbit_pack_png_preflate_{stamp}.zbpk"));
+
+        let stats = compress_adaptive_to_file(&input, &path).expect("compress adaptive");
+        let output = decompress_file(&path).expect("decompress adaptive");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(output, input);
+        assert!(
+            stats.png_preflate_xz_candidate_bytes.is_some(),
+            "png-preflate-xz candidate should be available for valid RGBA8 PNG"
         );
         assert!(stats.compressed_size <= stats.raw_candidate_bytes);
     }

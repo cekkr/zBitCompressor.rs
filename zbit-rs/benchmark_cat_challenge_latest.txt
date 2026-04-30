@@ -1,10 +1,10 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-04-29 23:07:45
+Generated: 2026-04-30 01:28:54
 Input file: /Users/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /Users/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge.zbpk
 
-Selected method: png-idat-raw
-Selection reason: png-idat-raw improves size: 2969440 -> 2965120 bytes
+Selected method: png-preflate-xz
+Selection reason: png-preflate-xz improves size: 2969440 -> 2677315 bytes
 Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
 
 Raw candidate size (bytes): 2969440
@@ -14,22 +14,23 @@ Indexed-huffman candidate size (bytes): 2969952
 Raw-deflate candidate size (bytes): 2969872
 Raw-zstd candidate size (bytes): 2969515
 Png-idat-raw candidate size (bytes): 2965120
+Png-preflate-xz candidate size (bytes): 2677315
 
 Original size (bytes): 2969404
-Compressed size (bytes): 2965120
-Compression ratio (compressed/original): 0.998557
-Space savings (%): 0.14
+Compressed size (bytes): 2677315
+Compression ratio (compressed/original): 0.901634
+Space savings (%): 9.84
 
-Compression time (ms): 2001.729
-Decompression time (ms): 7.766
-Compression throughput (MiB/s): 1.415
-Decompression throughput (MiB/s): 364.631
+Compression time (ms): 29545.718
+Decompression time (ms): 8332.002
+Compression throughput (MiB/s): 0.096
+Decompression throughput (MiB/s): 0.340
 
 Unique symbols: 256
 Bits per symbol index: 0
 Raw dictionary bytes: 256
 Circuit dictionary bytes: 0
 Huffman dictionary bytes: 0
-Packed index payload bytes: 2964802
+Packed index payload bytes: 2676962
 
 Output validation: PASS

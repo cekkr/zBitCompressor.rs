@@ -10,6 +10,7 @@ pub enum PackMethod {
     RawDeflate,
     RawZstd,
     PngIdatRaw,
+    PngPreflateXz,
 }
 
 impl PackMethod {
@@ -22,6 +23,7 @@ impl PackMethod {
             Self::RawDeflate => 4,
             Self::RawZstd => 5,
             Self::PngIdatRaw => 6,
+            Self::PngPreflateXz => 7,
         }
     }
 
@@ -34,6 +36,7 @@ impl PackMethod {
             4 => Some(Self::RawDeflate),
             5 => Some(Self::RawZstd),
             6 => Some(Self::PngIdatRaw),
+            7 => Some(Self::PngPreflateXz),
             _ => None,
         }
     }
@@ -47,6 +50,7 @@ impl PackMethod {
             Self::RawDeflate => "raw-deflate",
             Self::RawZstd => "raw-zstd",
             Self::PngIdatRaw => "png-idat-raw",
+            Self::PngPreflateXz => "png-preflate-xz",
         }
     }
 }
@@ -66,6 +70,7 @@ pub struct PackEvaluation {
     pub raw_deflate_total_bytes: Option<usize>,
     pub raw_zstd_total_bytes: Option<usize>,
     pub png_idat_raw_total_bytes: Option<usize>,
+    pub png_preflate_xz_total_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -85,6 +90,7 @@ impl PackEvaluation {
             raw_deflate_total_bytes: None,
             raw_zstd_total_bytes: None,
             png_idat_raw_total_bytes: None,
+            png_preflate_xz_total_bytes: None,
             chosen_method: PackMethod::RawCopy,
             chosen_reason: String::new(),
         }
@@ -183,6 +189,17 @@ pub fn choose_best_method(eval: &mut PackEvaluation) {
             best_reason = format!(
                 "png-idat-raw improves size: {} -> {} bytes",
                 eval.raw_total_bytes, png_idat_size
+            );
+        }
+    }
+
+    if let Some(preflate_size) = eval.png_preflate_xz_total_bytes {
+        if preflate_size < best_size {
+            best_method = PackMethod::PngPreflateXz;
+            best_size = preflate_size;
+            best_reason = format!(
+                "png-preflate-xz improves size: {} -> {} bytes",
+                eval.raw_total_bytes, preflate_size
             );
         }
     }
