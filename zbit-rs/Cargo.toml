@@ -19,5 +19,5 @@ path = "src/bin/benchmark_real_file.rs"
 flate2 = "1.1"
 zstd = "0.13"
 crc32fast = "1.5"
-preflate-rs = "0.7.6"
+preflate-rs = { path = "../vendor/preflate-rs" }
 xz2 = "0.1"

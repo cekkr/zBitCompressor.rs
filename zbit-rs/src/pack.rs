@@ -98,6 +98,8 @@ enum CircuitTransformKind {
     PeriodicHeadTailTailGatherDelta,
     PeriodicHeadTailTailDelta,
     PeriodicHeadTailTailXor,
+    PeriodicHeadTailDelta,
+    PeriodicHeadTailXor,
 }
 
 impl CircuitTransformKind {
@@ -116,6 +118,8 @@ impl CircuitTransformKind {
             Self::PeriodicHeadTailTailGatherDelta => "periodic-head-tail-tail-gather-delta",
             Self::PeriodicHeadTailTailDelta => "periodic-head-tail-tail-delta",
             Self::PeriodicHeadTailTailXor => "periodic-head-tail-tail-xor",
+            Self::PeriodicHeadTailDelta => "periodic-head-tail-delta",
+            Self::PeriodicHeadTailXor => "periodic-head-tail-xor",
         }
     }
 
@@ -134,6 +138,8 @@ impl CircuitTransformKind {
             Self::PeriodicHeadTailTailGatherDelta => 10,
             Self::PeriodicHeadTailTailDelta => 11,
             Self::PeriodicHeadTailTailXor => 12,
+            Self::PeriodicHeadTailDelta => 13,
+            Self::PeriodicHeadTailXor => 14,
         }
     }
 
@@ -152,6 +158,8 @@ impl CircuitTransformKind {
             10 => Some(Self::PeriodicHeadTailTailGatherDelta),
             11 => Some(Self::PeriodicHeadTailTailDelta),
             12 => Some(Self::PeriodicHeadTailTailXor),
+            13 => Some(Self::PeriodicHeadTailDelta),
+            14 => Some(Self::PeriodicHeadTailXor),
             _ => None,
         }
     }
@@ -1302,6 +1310,42 @@ fn invert_head_tail_tail_xor(
     invert_periodic_head_tail(&merged, original_len, period, 1)
 }
 
+fn apply_head_tail_delta(data: &[u8], period: usize, head: usize) -> Option<Vec<u8>> {
+    let head_tail = apply_periodic_head_tail(data, period, head)?;
+    Some(apply_unary_delta(&head_tail))
+}
+
+fn invert_head_tail_delta(
+    data: &[u8],
+    original_len: usize,
+    period: usize,
+    head: usize,
+) -> Option<Vec<u8>> {
+    if data.len() != original_len {
+        return None;
+    }
+    let recovered = invert_unary_delta(data);
+    invert_periodic_head_tail(&recovered, original_len, period, head)
+}
+
+fn apply_head_tail_xor(data: &[u8], period: usize, head: usize) -> Option<Vec<u8>> {
+    let head_tail = apply_periodic_head_tail(data, period, head)?;
+    Some(apply_unary_xor(&head_tail))
+}
+
+fn invert_head_tail_xor(
+    data: &[u8],
+    original_len: usize,
+    period: usize,
+    head: usize,
+) -> Option<Vec<u8>> {
+    if data.len() != original_len {
+        return None;
+    }
+    let recovered = invert_unary_xor(data);
+    invert_periodic_head_tail(&recovered, original_len, period, head)
+}
+
 fn apply_transform_plan(data: &[u8], plan: &CircuitTransformPlan) -> Option<Vec<u8>> {
     match plan.kind {
         CircuitTransformKind::Identity => Some(data.to_vec()),
@@ -1332,6 +1376,12 @@ fn apply_transform_plan(data: &[u8], plan: &CircuitTransformPlan) -> Option<Vec<
         }
         CircuitTransformKind::PeriodicHeadTailTailXor => {
             apply_head_tail_tail_xor(data, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailDelta => {
+            apply_head_tail_delta(data, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailXor => {
+            apply_head_tail_xor(data, plan.period as usize, plan.head as usize)
         }
     }
 }
@@ -1407,6 +1457,12 @@ fn invert_transform_plan(data: &[u8], original_len: usize, plan: &CircuitTransfo
         }
         CircuitTransformKind::PeriodicHeadTailTailXor => {
             invert_head_tail_tail_xor(data, original_len, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailDelta => {
+            invert_head_tail_delta(data, original_len, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailXor => {
+            invert_head_tail_xor(data, original_len, plan.period as usize, plan.head as usize)
         }
     }
 }
@@ -1539,6 +1595,8 @@ fn score_periodic_candidates(data: &[u8], max_period: usize, top_k: usize) -> Ve
 
 const TOPOLOGY_HASH_OFFSET: u64 = 0xcbf29ce484222325;
 const TOPOLOGY_HASH_PRIME: u64 = 0x100000001b3;
+const TOPOLOGY_NODE_BYTES: usize = 28;
+const TOPOLOGY_CORRECTION_PLAN_KIND_BASE: u8 = 200;
 
 fn topology_hash_mix(mut state: u64, value: u64) -> u64 {
     state ^= value;
@@ -1591,6 +1649,57 @@ fn push_topology_node(
         hash64: 0,
     });
     id
+}
+
+fn embed_correction_plan_in_topology(
+    nodes: &mut Vec<CircuitTopologyNode>,
+    correction_plan: &CircuitTransformPlan,
+) -> ZbitResult<bool> {
+    if correction_plan.kind == CircuitTransformKind::Identity
+        && correction_plan.period == 0
+        && correction_plan.head == 0
+    {
+        return Ok(false);
+    }
+
+    let root_id = nodes
+        .iter()
+        .find(|node| node.parent_id == u32::MAX)
+        .map(|node| node.id)
+        .ok_or_else(|| ZbitError::Internal("topology root node missing".to_string()))?;
+    let order = nodes
+        .iter()
+        .filter(|node| node.parent_id == root_id && node.relation == 0)
+        .map(|node| node.order)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let kind = TOPOLOGY_CORRECTION_PLAN_KIND_BASE.saturating_add(correction_plan.kind.as_u8());
+    let _ = push_topology_node(
+        nodes,
+        root_id,
+        0,
+        order,
+        kind,
+        correction_plan.period,
+        correction_plan.head,
+    );
+    finalize_topology_hashes(nodes)?;
+    Ok(true)
+}
+
+fn decode_embedded_correction_plan(
+    kind: u8,
+    period: u32,
+    head: u32,
+) -> Option<CircuitTransformPlan> {
+    let kind_u8 = kind.checked_sub(TOPOLOGY_CORRECTION_PLAN_KIND_BASE)?;
+    let transform_kind = CircuitTransformKind::from_u8(kind_u8)?;
+    Some(CircuitTransformPlan {
+        kind: transform_kind,
+        period,
+        head,
+    })
 }
 
 fn build_topology_for_plan(plan: &CircuitTransformPlan) -> ZbitResult<Vec<CircuitTopologyNode>> {
@@ -1694,6 +1803,14 @@ fn build_topology_for_plan(plan: &CircuitTransformPlan) -> ZbitResult<Vec<Circui
             );
             let _ = push_topology_node(&mut nodes, tail_id, 0, 0, 16, plan.head, 0);
         }
+        CircuitTransformKind::PeriodicHeadTailDelta => {
+            let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, plan.head);
+            let _ = push_topology_node(&mut nodes, split_id, 0, 0, 17, 1, 0);
+        }
+        CircuitTransformKind::PeriodicHeadTailXor => {
+            let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, plan.head);
+            let _ = push_topology_node(&mut nodes, split_id, 0, 0, 18, 1, 0);
+        }
     }
 
     finalize_topology_hashes(&mut nodes)?;
@@ -1769,6 +1886,16 @@ fn choose_adaptive_transform_plan(
             period: period_u32,
             head: 1,
         });
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicHeadTailDelta,
+            period: period_u32,
+            head: 1,
+        });
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicHeadTailXor,
+            period: period_u32,
+            head: 1,
+        });
         for tail_gather_period in [2u32, 4, 8] {
             if (period_u32.saturating_sub(1)) >= tail_gather_period && tail_gather_period >= 2 {
                 add_plan(CircuitTransformPlan {
@@ -1783,7 +1910,19 @@ fn choose_adaptive_transform_plan(
                 });
             }
         }
-        for tail_delta_period in [2u32, 4, 8, 16] {
+        let mut tail_delta_periods = vec![2u32, 4, 8, 16];
+        let full_tail_period = period_u32.saturating_sub(1);
+        if full_tail_period >= 2 {
+            tail_delta_periods.push(full_tail_period);
+        }
+        let half_tail_period = full_tail_period / 2;
+        if half_tail_period >= 2 {
+            tail_delta_periods.push(half_tail_period);
+        }
+        tail_delta_periods.sort_unstable();
+        tail_delta_periods.dedup();
+
+        for tail_delta_period in tail_delta_periods {
             if (period_u32.saturating_sub(1)) >= tail_delta_period && tail_delta_period >= 2 {
                 add_plan(CircuitTransformPlan {
                     kind: CircuitTransformKind::PeriodicHeadTailTailDelta,
@@ -1803,12 +1942,32 @@ fn choose_adaptive_transform_plan(
                 period: period_u32,
                 head: 2,
             });
+            add_plan(CircuitTransformPlan {
+                kind: CircuitTransformKind::PeriodicHeadTailDelta,
+                period: period_u32,
+                head: 2,
+            });
+            add_plan(CircuitTransformPlan {
+                kind: CircuitTransformKind::PeriodicHeadTailXor,
+                period: period_u32,
+                head: 2,
+            });
         }
         if period > 8 {
             let half = (period / 2) as u32;
             if half > 0 && half < period_u32 {
                 add_plan(CircuitTransformPlan {
                     kind: CircuitTransformKind::PeriodicHeadTail,
+                    period: period_u32,
+                    head: half,
+                });
+                add_plan(CircuitTransformPlan {
+                    kind: CircuitTransformKind::PeriodicHeadTailDelta,
+                    period: period_u32,
+                    head: half,
+                });
+                add_plan(CircuitTransformPlan {
+                    kind: CircuitTransformKind::PeriodicHeadTailXor,
                     period: period_u32,
                     head: half,
                 });
@@ -1846,17 +2005,47 @@ fn choose_adaptive_transform_plan(
             selected.push(plan);
         }
         if idx == 0 {
+            let period_u32 = period as u32;
+            let mut forced_tail_heads = vec![4u32];
+            let full_tail = period_u32.saturating_sub(1);
+            if full_tail >= 2 {
+                forced_tail_heads.push(full_tail);
+            }
+            let half_tail = full_tail / 2;
+            if half_tail >= 2 {
+                forced_tail_heads.push(half_tail);
+            }
+            forced_tail_heads.sort_unstable();
+            forced_tail_heads.dedup();
+
             for forced_kind in [
-                CircuitTransformKind::PeriodicHeadTailTailDelta,
-                CircuitTransformKind::PeriodicHeadTailTailGather,
+                CircuitTransformKind::PeriodicHeadTailDelta,
+                CircuitTransformKind::PeriodicHeadTailXor,
             ] {
                 let forced = CircuitTransformPlan {
                     kind: forced_kind,
-                    period: period as u32,
+                    period: period_u32,
                     head: 4,
                 };
                 if selected_set.insert(forced) {
                     selected.push(forced);
+                }
+            }
+
+            for head in forced_tail_heads {
+                for forced_kind in [
+                    CircuitTransformKind::PeriodicHeadTailTailDelta,
+                    CircuitTransformKind::PeriodicHeadTailTailXor,
+                    CircuitTransformKind::PeriodicHeadTailTailGather,
+                ] {
+                    let forced = CircuitTransformPlan {
+                        kind: forced_kind,
+                        period: period_u32,
+                        head,
+                    };
+                    if selected_set.insert(forced) {
+                        selected.push(forced);
+                    }
                 }
             }
         }
@@ -1922,6 +2111,32 @@ fn choose_adaptive_transform_plan(
     Ok((plan, topology, codec, encoded))
 }
 
+fn choose_correction_transform_plan(
+    corrections: &[u8],
+) -> ZbitResult<(CircuitTransformPlan, PayloadCodec, Vec<u8>)> {
+    let identity_plan = CircuitTransformPlan {
+        kind: CircuitTransformKind::Identity,
+        period: 0,
+        head: 0,
+    };
+    let (identity_codec, identity_payload) = choose_best_codec(corrections, true, true)?;
+    let (candidate_plan, _, candidate_codec, candidate_payload) =
+        choose_adaptive_transform_plan(corrections)?;
+
+    let candidate_total = candidate_payload.len()
+        + if candidate_plan == identity_plan {
+            0
+        } else {
+            TOPOLOGY_NODE_BYTES
+        };
+
+    if candidate_total < identity_payload.len() {
+        Ok((candidate_plan, candidate_codec, candidate_payload))
+    } else {
+        Ok((identity_plan, identity_codec, identity_payload))
+    }
+}
+
 fn build_recursive_circuit_stream(_input: &[u8], base: &FramedPayloadRun) -> ZbitResult<Option<RecursiveCircuitStream>> {
 
     if base.payload.len() < 6 {
@@ -1944,10 +2159,12 @@ fn build_recursive_circuit_stream(_input: &[u8], base: &FramedPayloadRun) -> Zbi
     };
 
     let plain_bytes = plain.text();
-    let (transform_plan, topology, transformed_codec, transformed_payload) =
+    let (transform_plan, mut topology, transformed_codec, transformed_payload) =
         choose_adaptive_transform_plan(plain_bytes)?;
     let corrections = chunk.corrections;
-    let (correction_codec, corrections_payload) = choose_best_codec(&corrections, true, false)?;
+    let (correction_plan, correction_codec, corrections_payload) =
+        choose_correction_transform_plan(&corrections)?;
+    let _ = embed_correction_plan_in_topology(&mut topology, &correction_plan)?;
     let plain_len = plain_bytes.len();
     let transformed_encoded_len = transformed_payload.len();
     let correction_plain_len = corrections.len();
@@ -1963,7 +2180,13 @@ fn build_recursive_circuit_stream(_input: &[u8], base: &FramedPayloadRun) -> Zbi
             transformed_codec.name(),
             correction_encoded_len,
             correction_codec.name(),
-            correction_plain_len
+            correction_plain_len,
+        );
+        eprintln!(
+            "zbit-trace recursive correction-plan={} period={} head={}",
+            correction_plan.kind.name(),
+            correction_plan.period,
+            correction_plan.head
         );
     }
 
@@ -1985,7 +2208,7 @@ fn build_recursive_circuit_stream(_input: &[u8], base: &FramedPayloadRun) -> Zbi
 }
 
 fn recursive_circuit_dictionary_size(stream: &RecursiveCircuitStream) -> usize {
-    framed_dictionary_size(&stream.base) + 51 + stream.topology.len() * 28
+    framed_dictionary_size(&stream.base) + 51 + stream.topology.len() * TOPOLOGY_NODE_BYTES
 }
 
 fn write_recursive_circuit_dictionary(out: &mut Vec<u8>, stream: &RecursiveCircuitStream) {
@@ -2071,6 +2294,11 @@ fn decode_recursive_circuit_payload(
     let transform_period = read_u32(dict_bytes, &mut dict_cursor)?;
     let transform_head = read_u32(dict_bytes, &mut dict_cursor)?;
     let topology_count = read_u16(dict_bytes, &mut dict_cursor)? as usize;
+    let mut correction_plan = CircuitTransformPlan {
+        kind: CircuitTransformKind::Identity,
+        period: 0,
+        head: 0,
+    };
 
     let mut seen_root = false;
     let mut last_id = 0u32;
@@ -2119,6 +2347,9 @@ fn decode_recursive_circuit_payload(
                 "recursive-circuit-xz topology hash mismatch".to_string(),
             ));
         }
+        if let Some(plan) = decode_embedded_correction_plan(kind, param_a, param_b) {
+            correction_plan = plan;
+        }
         hash_by_id.insert(id, expected_hash);
         last_id = id;
     }
@@ -2147,7 +2378,14 @@ fn decode_recursive_circuit_payload(
     let transformed_payload = &payload[..transformed_encoded_len];
     let corrections_payload = &payload[transformed_encoded_len..];
     let transformed = decode_with_codec(transformed_payload, transformed_codec, plain_len)?;
-    let corrections = decode_with_codec(corrections_payload, correction_codec, correction_plain_len)?;
+    let correction_transformed =
+        decode_with_codec(corrections_payload, correction_codec, correction_plain_len)?;
+    let corrections = invert_transform_plan(
+        &correction_transformed,
+        correction_plain_len,
+        &correction_plan,
+    )
+    .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz correction stream is invalid".to_string()))?;
     let plan = CircuitTransformPlan {
         kind: transform_kind,
         period: transform_period,
