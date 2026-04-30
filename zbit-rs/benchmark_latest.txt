@@ -1,5 +1,5 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-04-30 01:28:09
+Generated: 2026-04-30 01:40:34
 Input file: papers/zbit-algorithmsResearch.md
 Compressed artifact: zbit-rs/benchmark_algorithmsResearch.zbpk
 
@@ -21,10 +21,10 @@ Compressed size (bytes): 20972
 Compression ratio (compressed/original): 0.338176
 Space savings (%): 66.18
 
-Compression time (ms): 95.563
-Decompression time (ms): 6.385
-Compression throughput (MiB/s): 0.619
-Decompression throughput (MiB/s): 9.263
+Compression time (ms): 93.202
+Decompression time (ms): 2.810
+Compression throughput (MiB/s): 0.635
+Decompression throughput (MiB/s): 21.047
 
 Unique symbols: 114
 Bits per symbol index: 0
