@@ -1,5 +1,5 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-04-30 01:40:34
+Generated: 2026-04-30 03:31:13
 Input file: papers/zbit-algorithmsResearch.md
 Compressed artifact: zbit-rs/benchmark_algorithmsResearch.zbpk
 
@@ -13,18 +13,18 @@ Indexed-circuit candidate size (bytes): skipped by rules
 Indexed-huffman candidate size (bytes): 37556
 Raw-deflate candidate size (bytes): 22068
 Raw-zstd candidate size (bytes): 20972
-Png-idat-raw candidate size (bytes): unavailable
-Png-preflate-xz candidate size (bytes): unavailable
+Framed-raw candidate size (bytes): unavailable
+Recursive-circuit-xz candidate size (bytes): unavailable
 
 Original size (bytes): 62015
 Compressed size (bytes): 20972
 Compression ratio (compressed/original): 0.338176
 Space savings (%): 66.18
 
-Compression time (ms): 93.202
-Decompression time (ms): 2.810
-Compression throughput (MiB/s): 0.635
-Decompression throughput (MiB/s): 21.047
+Compression time (ms): 93.630
+Decompression time (ms): 3.839
+Compression throughput (MiB/s): 0.632
+Decompression throughput (MiB/s): 15.407
 
 Unique symbols: 114
 Bits per symbol index: 0

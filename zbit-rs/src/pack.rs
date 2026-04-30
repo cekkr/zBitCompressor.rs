@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -41,8 +41,8 @@ pub struct PackStats {
     pub indexed_huffman_candidate_bytes: Option<usize>,
     pub raw_deflate_candidate_bytes: Option<usize>,
     pub raw_zstd_candidate_bytes: Option<usize>,
-    pub png_idat_raw_candidate_bytes: Option<usize>,
-    pub png_preflate_xz_candidate_bytes: Option<usize>,
+    pub framed_raw_candidate_bytes: Option<usize>,
+    pub recursive_circuit_xz_candidate_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -72,9 +72,10 @@ struct HuffmanNode {
 }
 
 #[derive(Debug, Clone)]
-struct PngIdatStream {
+struct FramedPayloadRun {
     prefix: Vec<u8>,
     suffix: Vec<u8>,
+    frame_tag: [u8; 4],
     payload: Vec<u8>,
     base_chunk_len: u32,
     full_chunk_count: u32,
@@ -82,21 +83,57 @@ struct PngIdatStream {
     total_chunks: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 enum CircuitTransformKind {
     Identity,
     DeltaPrev,
     XorPrev,
     PeriodicHeadTail,
+    PeriodicGather,
+    PeriodicDelta,
+    PeriodicXor,
+    PeriodicGatherDelta,
+    PeriodicGatherXor,
+    PeriodicHeadTailTailGather,
+    PeriodicHeadTailTailGatherDelta,
+    PeriodicHeadTailTailDelta,
+    PeriodicHeadTailTailXor,
 }
 
 impl CircuitTransformKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::DeltaPrev => "delta-prev",
+            Self::XorPrev => "xor-prev",
+            Self::PeriodicHeadTail => "periodic-head-tail",
+            Self::PeriodicGather => "periodic-gather",
+            Self::PeriodicDelta => "periodic-delta",
+            Self::PeriodicXor => "periodic-xor",
+            Self::PeriodicGatherDelta => "periodic-gather-delta",
+            Self::PeriodicGatherXor => "periodic-gather-xor",
+            Self::PeriodicHeadTailTailGather => "periodic-head-tail-tail-gather",
+            Self::PeriodicHeadTailTailGatherDelta => "periodic-head-tail-tail-gather-delta",
+            Self::PeriodicHeadTailTailDelta => "periodic-head-tail-tail-delta",
+            Self::PeriodicHeadTailTailXor => "periodic-head-tail-tail-xor",
+        }
+    }
+
     fn as_u8(self) -> u8 {
         match self {
             Self::Identity => 0,
             Self::DeltaPrev => 1,
             Self::XorPrev => 2,
             Self::PeriodicHeadTail => 3,
+            Self::PeriodicGather => 4,
+            Self::PeriodicDelta => 5,
+            Self::PeriodicXor => 6,
+            Self::PeriodicGatherDelta => 7,
+            Self::PeriodicGatherXor => 8,
+            Self::PeriodicHeadTailTailGather => 9,
+            Self::PeriodicHeadTailTailGatherDelta => 10,
+            Self::PeriodicHeadTailTailDelta => 11,
+            Self::PeriodicHeadTailTailXor => 12,
         }
     }
 
@@ -106,12 +143,21 @@ impl CircuitTransformKind {
             1 => Some(Self::DeltaPrev),
             2 => Some(Self::XorPrev),
             3 => Some(Self::PeriodicHeadTail),
+            4 => Some(Self::PeriodicGather),
+            5 => Some(Self::PeriodicDelta),
+            6 => Some(Self::PeriodicXor),
+            7 => Some(Self::PeriodicGatherDelta),
+            8 => Some(Self::PeriodicGatherXor),
+            9 => Some(Self::PeriodicHeadTailTailGather),
+            10 => Some(Self::PeriodicHeadTailTailGatherDelta),
+            11 => Some(Self::PeriodicHeadTailTailDelta),
+            12 => Some(Self::PeriodicHeadTailTailXor),
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 struct CircuitTransformPlan {
     kind: CircuitTransformKind,
     period: u32,
@@ -127,16 +173,58 @@ struct CircuitTopologyNode {
     kind: u8,
     param_a: u32,
     param_b: u32,
+    hash64: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PayloadCodec {
+    Raw,
+    Xz,
+    Zstd,
+    XzExtreme,
+}
+
+impl PayloadCodec {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+            Self::XzExtreme => "xz-extreme",
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Raw => 0,
+            Self::Xz => 1,
+            Self::Zstd => 2,
+            Self::XzExtreme => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Raw),
+            1 => Some(Self::Xz),
+            2 => Some(Self::Zstd),
+            3 => Some(Self::XzExtreme),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-struct PngPreflateStream {
-    base: PngIdatStream,
+struct RecursiveCircuitStream {
+    base: FramedPayloadRun,
     transformed_payload: Vec<u8>,
-    corrections: Vec<u8>,
+    corrections_payload: Vec<u8>,
     plain_len: usize,
-    transformed_len: usize,
-    correction_len: usize,
+    transformed_encoded_len: usize,
+    correction_plain_len: usize,
+    correction_encoded_len: usize,
+    transformed_codec: PayloadCodec,
+    correction_codec: PayloadCodec,
     zlib_header: [u8; 2],
     zlib_adler32: [u8; 4],
     transform_plan: CircuitTransformPlan,
@@ -561,8 +649,7 @@ fn decode_raw_deflate_payload(payload: &[u8], original_size: usize) -> ZbitResul
 }
 
 fn build_raw_zstd_payload(input: &[u8]) -> ZbitResult<Vec<u8>> {
-    zstd_stream::encode_all(input, 19)
-        .map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
+    zstd_stream::encode_all(input, 19).map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
 }
 
 fn decode_raw_zstd_payload(payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
@@ -676,108 +763,112 @@ fn read_u32_be_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-fn build_png_idat_stream(input: &[u8]) -> Option<PngIdatStream> {
-    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    const IDAT: &[u8; 4] = b"IDAT";
-    const IEND: &[u8; 4] = b"IEND";
+fn parse_crc32_frame_at(input: &[u8], start: usize) -> Option<(u32, [u8; 4], usize, usize)> {
+    let frame_len_u32 = read_u32_be_at(input, start)?;
+    let frame_len = frame_len_u32 as usize;
+    let tag_off = start.checked_add(4)?;
+    let tag_slice = input.get(tag_off..tag_off + 4)?;
+    let tag = [tag_slice[0], tag_slice[1], tag_slice[2], tag_slice[3]];
+    let data_off = tag_off + 4;
+    let data_end = data_off.checked_add(frame_len)?;
+    let crc_off = data_end;
+    let next = crc_off.checked_add(4)?;
+    if next > input.len() {
+        return None;
+    }
+    let data = input.get(data_off..data_end)?;
+    let crc = read_u32_be_at(input, crc_off)?;
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&tag);
+    hasher.update(data);
+    if hasher.finalize() != crc {
+        return None;
+    }
+    Some((frame_len_u32, tag, data_off, next))
+}
 
-    if input.len() < 8 || &input[..8] != PNG_SIGNATURE {
+fn build_framed_payload_run(input: &[u8]) -> Option<FramedPayloadRun> {
+    if input.len() < 24 {
         return None;
     }
 
-    let mut cursor = 8usize;
-    let mut first_idat_start: Option<usize> = None;
-    let mut last_idat_end = 0usize;
-    let mut saw_idat = false;
-    let mut closed_idat_run = false;
+    let mut best: Option<(usize, FramedPayloadRun)> = None;
+    let mut start = 0usize;
 
-    let mut chunk_lengths = Vec::<u32>::new();
-    let mut payload = Vec::<u8>::new();
+    while start + 12 <= input.len() {
+        let Some((first_len_u32, first_tag, first_data_off, first_next)) = parse_crc32_frame_at(input, start) else {
+            start += 1;
+            continue;
+        };
 
-    while cursor.checked_add(12)? <= input.len() {
-        let chunk_start = cursor;
-        let chunk_len_u32 = read_u32_be_at(input, cursor)?;
-        cursor += 4;
+        let mut chunk_lengths = vec![first_len_u32];
+        let mut payload = Vec::<u8>::new();
+        payload.extend_from_slice(input.get(first_data_off..first_data_off + first_len_u32 as usize)?);
 
-        let chunk_type = input.get(cursor..cursor + 4)?;
-        cursor += 4;
-
-        let chunk_len = chunk_len_u32 as usize;
-        let data = input.get(cursor..cursor + chunk_len)?;
-        cursor += chunk_len;
-
-        let chunk_crc = read_u32_be_at(input, cursor)?;
-        cursor += 4;
-
-        if chunk_type == IDAT {
-            if closed_idat_run {
-                return None;
+        let mut cursor = first_next;
+        while let Some((len_u32, tag, data_off, next)) = parse_crc32_frame_at(input, cursor) {
+            if tag != first_tag {
+                break;
             }
-            saw_idat = true;
-            first_idat_start.get_or_insert(chunk_start);
-            chunk_lengths.push(chunk_len_u32);
-            payload.extend_from_slice(data);
-            last_idat_end = cursor;
+            chunk_lengths.push(len_u32);
+            payload.extend_from_slice(input.get(data_off..data_off + len_u32 as usize)?);
+            cursor = next;
+        }
 
-            let mut hasher = Crc32Hasher::new();
-            hasher.update(IDAT);
-            hasher.update(data);
-            if hasher.finalize() != chunk_crc {
-                return None;
+        if chunk_lengths.len() < 2 {
+            start += 1;
+            continue;
+        }
+
+        let total_chunks = u32::try_from(chunk_lengths.len()).ok()?;
+        let base_chunk_len = chunk_lengths[0];
+        let mut full_chunk_count = total_chunks;
+        let mut tail_chunk_len = 0u32;
+
+        if chunk_lengths.iter().any(|&len| len != base_chunk_len) {
+            if chunk_lengths
+                .iter()
+                .take(chunk_lengths.len().saturating_sub(1))
+                .any(|&len| len != base_chunk_len)
+            {
+                start += 1;
+                continue;
             }
-        } else if saw_idat {
-            closed_idat_run = true;
+            full_chunk_count = total_chunks.saturating_sub(1);
+            tail_chunk_len = *chunk_lengths.last().unwrap_or(&0u32);
         }
 
-        if chunk_type == IEND {
-            break;
-        }
-    }
+        let run = FramedPayloadRun {
+            prefix: input[..start].to_vec(),
+            suffix: input[cursor..].to_vec(),
+            frame_tag: first_tag,
+            payload,
+            base_chunk_len,
+            full_chunk_count,
+            tail_chunk_len,
+            total_chunks,
+        };
 
-    let first_start = first_idat_start?;
-    if chunk_lengths.is_empty() || last_idat_end <= first_start {
-        return None;
-    }
-
-    let total_chunks = u32::try_from(chunk_lengths.len()).ok()?;
-    let base_chunk_len = chunk_lengths[0];
-    let mut full_chunk_count = total_chunks;
-    let mut tail_chunk_len = 0u32;
-
-    if chunk_lengths.iter().any(|&len| len != base_chunk_len) {
-        if chunk_lengths
-            .iter()
-            .take(chunk_lengths.len().saturating_sub(1))
-            .any(|&len| len != base_chunk_len)
-        {
-            return None;
+        let candidate_size = ZBPK_HEADER_BYTES + framed_dictionary_size(&run) + run.payload.len();
+        match &best {
+            Some((best_size, _)) if *best_size <= candidate_size => {}
+            _ => best = Some((candidate_size, run)),
         }
 
-        full_chunk_count = total_chunks.saturating_sub(1);
-        tail_chunk_len = *chunk_lengths.last().unwrap_or(&0u32);
+        start += 1;
     }
 
-    let prefix = input[..first_start].to_vec();
-    let suffix = input[last_idat_end..].to_vec();
-
-    Some(PngIdatStream {
-        prefix,
-        suffix,
-        payload,
-        base_chunk_len,
-        full_chunk_count,
-        tail_chunk_len,
-        total_chunks,
-    })
+    best.map(|(_, run)| run)
 }
 
-fn png_idat_dictionary_size(stream: &PngIdatStream) -> usize {
-    24usize + stream.prefix.len() + stream.suffix.len()
+fn framed_dictionary_size(stream: &FramedPayloadRun) -> usize {
+    28usize + stream.prefix.len() + stream.suffix.len()
 }
 
-fn write_png_idat_dictionary(out: &mut Vec<u8>, stream: &PngIdatStream) {
+fn write_framed_dictionary(out: &mut Vec<u8>, stream: &FramedPayloadRun) {
     push_u32(out, stream.prefix.len() as u32);
     push_u32(out, stream.suffix.len() as u32);
+    out.extend_from_slice(&stream.frame_tag);
     push_u32(out, stream.base_chunk_len);
     push_u32(out, stream.full_chunk_count);
     push_u32(out, stream.tail_chunk_len);
@@ -786,10 +877,15 @@ fn write_png_idat_dictionary(out: &mut Vec<u8>, stream: &PngIdatStream) {
     out.extend_from_slice(&stream.suffix);
 }
 
-fn decode_png_idat_payload(dict_bytes: &[u8], payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
+fn decode_framed_payload(dict_bytes: &[u8], payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
     let mut dict_cursor = 0usize;
     let prefix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
     let suffix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tag_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 4)
+        .ok_or_else(|| ZbitError::Parse("framed-raw missing frame tag".to_string()))?;
+    dict_cursor += 4;
+    let frame_tag = [tag_slice[0], tag_slice[1], tag_slice[2], tag_slice[3]];
     let base_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
     let full_chunk_count = read_u32(dict_bytes, &mut dict_cursor)? as usize;
     let tail_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
@@ -797,17 +893,17 @@ fn decode_png_idat_payload(dict_bytes: &[u8], payload: &[u8], original_size: usi
 
     let prefix = dict_bytes
         .get(dict_cursor..dict_cursor + prefix_len)
-        .ok_or_else(|| ZbitError::Parse("png-idat-raw prefix range out of bounds".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("framed-raw prefix range out of bounds".to_string()))?;
     dict_cursor += prefix_len;
 
     let suffix = dict_bytes
         .get(dict_cursor..dict_cursor + suffix_len)
-        .ok_or_else(|| ZbitError::Parse("png-idat-raw suffix range out of bounds".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("framed-raw suffix range out of bounds".to_string()))?;
     dict_cursor += suffix_len;
 
     if dict_cursor != dict_bytes.len() {
         return Err(ZbitError::Parse(
-            "trailing bytes in png-idat-raw dictionary".to_string(),
+            "trailing bytes in framed-raw dictionary".to_string(),
         ));
     }
 
@@ -817,32 +913,32 @@ fn decode_png_idat_payload(dict_bytes: &[u8], payload: &[u8], original_size: usi
         true
     } else {
         return Err(ZbitError::Parse(
-            "png-idat-raw dictionary has inconsistent chunk counters".to_string(),
+            "framed-raw dictionary has inconsistent chunk counters".to_string(),
         ));
     };
 
     let expected_payload = full_chunk_count
         .checked_mul(base_chunk_len)
         .and_then(|v| if tail_present { v.checked_add(tail_chunk_len) } else { Some(v) })
-        .ok_or_else(|| ZbitError::Parse("png-idat-raw payload length overflow".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("framed-raw payload length overflow".to_string()))?;
 
     if payload.len() != expected_payload {
         return Err(ZbitError::Parse(format!(
-            "png-idat-raw payload length mismatch: expected {expected_payload} got {}",
+            "framed-raw payload length mismatch: expected {expected_payload} got {}",
             payload.len()
         )));
     }
 
     let chunk_overhead = total_chunks
         .checked_mul(12)
-        .ok_or_else(|| ZbitError::Parse("png-idat-raw chunk overhead overflow".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("framed-raw chunk overhead overflow".to_string()))?;
     let mut out = Vec::with_capacity(
         prefix
             .len()
             .checked_add(payload.len())
             .and_then(|v| v.checked_add(suffix.len()))
             .and_then(|v| v.checked_add(chunk_overhead))
-            .ok_or_else(|| ZbitError::Parse("png-idat-raw output length overflow".to_string()))?,
+            .ok_or_else(|| ZbitError::Parse("framed-raw output length overflow".to_string()))?,
     );
 
     out.extend_from_slice(prefix);
@@ -856,15 +952,15 @@ fn decode_png_idat_payload(dict_bytes: &[u8], payload: &[u8], original_size: usi
         };
         let chunk_data = payload
             .get(payload_cursor..payload_cursor + chunk_len)
-            .ok_or_else(|| ZbitError::Parse("png-idat-raw payload chunk range out of bounds".to_string()))?;
+            .ok_or_else(|| ZbitError::Parse("framed-raw payload chunk range out of bounds".to_string()))?;
         payload_cursor += chunk_len;
 
         push_u32_be(&mut out, chunk_len as u32);
-        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(&frame_tag);
         out.extend_from_slice(chunk_data);
 
         let mut hasher = Crc32Hasher::new();
-        hasher.update(b"IDAT");
+        hasher.update(&frame_tag);
         hasher.update(chunk_data);
         push_u32_be(&mut out, hasher.finalize());
     }
@@ -873,7 +969,7 @@ fn decode_png_idat_payload(dict_bytes: &[u8], payload: &[u8], original_size: usi
 
     if out.len() != original_size {
         return Err(ZbitError::Parse(format!(
-            "png-idat-raw output length mismatch: expected {original_size} got {}",
+            "framed-raw output length mismatch: expected {original_size} got {}",
             out.len()
         )));
     }
@@ -987,6 +1083,225 @@ fn invert_periodic_head_tail(data: &[u8], original_len: usize, period: usize, he
     }
 }
 
+fn apply_periodic_gather(data: &[u8], period: usize) -> Option<Vec<u8>> {
+    if period < 2 || period > data.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for offset in 0..period {
+        let mut cursor = offset;
+        while cursor < data.len() {
+            out.push(data[cursor]);
+            cursor = cursor.saturating_add(period);
+        }
+    }
+    Some(out)
+}
+
+fn invert_periodic_gather(data: &[u8], original_len: usize, period: usize) -> Option<Vec<u8>> {
+    if period < 2 || period > original_len || data.len() != original_len {
+        return None;
+    }
+    let mut out = vec![0u8; original_len];
+    let mut read_cursor = 0usize;
+    for offset in 0..period {
+        let mut cursor = offset;
+        while cursor < original_len {
+            out[cursor] = *data.get(read_cursor)?;
+            read_cursor += 1;
+            cursor = cursor.saturating_add(period);
+        }
+    }
+    if read_cursor != data.len() {
+        return None;
+    }
+    Some(out)
+}
+
+fn apply_periodic_delta(data: &[u8], period: usize) -> Option<Vec<u8>> {
+    if period < 2 || period > data.len() {
+        return None;
+    }
+    let mut out = data.to_vec();
+    for i in period..data.len() {
+        out[i] = data[i].wrapping_sub(data[i - period]);
+    }
+    Some(out)
+}
+
+fn invert_periodic_delta(data: &[u8], period: usize) -> Option<Vec<u8>> {
+    if period < 2 || period > data.len() {
+        return None;
+    }
+    let mut out = data.to_vec();
+    for i in period..data.len() {
+        out[i] = data[i].wrapping_add(out[i - period]);
+    }
+    Some(out)
+}
+
+fn apply_periodic_xor(data: &[u8], period: usize) -> Option<Vec<u8>> {
+    if period < 2 || period > data.len() {
+        return None;
+    }
+    let mut out = data.to_vec();
+    for i in period..data.len() {
+        out[i] = data[i] ^ data[i - period];
+    }
+    Some(out)
+}
+
+fn invert_periodic_xor(data: &[u8], period: usize) -> Option<Vec<u8>> {
+    if period < 2 || period > data.len() {
+        return None;
+    }
+    let mut out = data.to_vec();
+    for i in period..data.len() {
+        out[i] = data[i] ^ out[i - period];
+    }
+    Some(out)
+}
+
+fn periodic_head_bytes(original_len: usize, period: usize, head: usize) -> Option<usize> {
+    if period < 2 || head == 0 || head >= period {
+        return None;
+    }
+    let mut total_head = 0usize;
+    let mut cursor = 0usize;
+    while cursor < original_len {
+        let end = (cursor + period).min(original_len);
+        total_head = total_head.checked_add(head.min(end - cursor))?;
+        cursor = end;
+    }
+    Some(total_head)
+}
+
+fn apply_head_tail_tail_gather(data: &[u8], period: usize, tail_gather_period: usize) -> Option<Vec<u8>> {
+    let head_tail = apply_periodic_head_tail(data, period, 1)?;
+    let total_head = periodic_head_bytes(data.len(), period, 1)?;
+    let head_stream = head_tail.get(..total_head)?;
+    let tail_stream = head_tail.get(total_head..)?;
+    let tail_gathered = apply_periodic_gather(tail_stream, tail_gather_period)?;
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(head_stream);
+    out.extend_from_slice(&tail_gathered);
+    Some(out)
+}
+
+fn invert_head_tail_tail_gather(
+    data: &[u8],
+    original_len: usize,
+    period: usize,
+    tail_gather_period: usize,
+) -> Option<Vec<u8>> {
+    if data.len() != original_len {
+        return None;
+    }
+    let total_head = periodic_head_bytes(original_len, period, 1)?;
+    let head_stream = data.get(..total_head)?;
+    let tail_stream = data.get(total_head..)?;
+    let tail = invert_periodic_gather(tail_stream, original_len - total_head, tail_gather_period)?;
+    let mut merged = Vec::with_capacity(original_len);
+    merged.extend_from_slice(head_stream);
+    merged.extend_from_slice(&tail);
+    invert_periodic_head_tail(&merged, original_len, period, 1)
+}
+
+fn apply_head_tail_tail_gather_delta(data: &[u8], period: usize, tail_gather_period: usize) -> Option<Vec<u8>> {
+    let head_tail = apply_periodic_head_tail(data, period, 1)?;
+    let total_head = periodic_head_bytes(data.len(), period, 1)?;
+    let head_stream = head_tail.get(..total_head)?;
+    let tail_stream = head_tail.get(total_head..)?;
+    let tail_gathered = apply_periodic_gather(tail_stream, tail_gather_period)?;
+    let tail_delta = apply_unary_delta(&tail_gathered);
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(head_stream);
+    out.extend_from_slice(&tail_delta);
+    Some(out)
+}
+
+fn invert_head_tail_tail_gather_delta(
+    data: &[u8],
+    original_len: usize,
+    period: usize,
+    tail_gather_period: usize,
+) -> Option<Vec<u8>> {
+    if data.len() != original_len {
+        return None;
+    }
+    let total_head = periodic_head_bytes(original_len, period, 1)?;
+    let head_stream = data.get(..total_head)?;
+    let tail_delta = data.get(total_head..)?;
+    let tail_gathered = invert_unary_delta(tail_delta);
+    let tail = invert_periodic_gather(&tail_gathered, original_len - total_head, tail_gather_period)?;
+    let mut merged = Vec::with_capacity(original_len);
+    merged.extend_from_slice(head_stream);
+    merged.extend_from_slice(&tail);
+    invert_periodic_head_tail(&merged, original_len, period, 1)
+}
+
+fn apply_head_tail_tail_delta(data: &[u8], period: usize, tail_delta_period: usize) -> Option<Vec<u8>> {
+    let head_tail = apply_periodic_head_tail(data, period, 1)?;
+    let total_head = periodic_head_bytes(data.len(), period, 1)?;
+    let head_stream = head_tail.get(..total_head)?;
+    let tail_stream = head_tail.get(total_head..)?;
+    let tail_delta = apply_periodic_delta(tail_stream, tail_delta_period)?;
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(head_stream);
+    out.extend_from_slice(&tail_delta);
+    Some(out)
+}
+
+fn invert_head_tail_tail_delta(
+    data: &[u8],
+    original_len: usize,
+    period: usize,
+    tail_delta_period: usize,
+) -> Option<Vec<u8>> {
+    if data.len() != original_len {
+        return None;
+    }
+    let total_head = periodic_head_bytes(original_len, period, 1)?;
+    let head_stream = data.get(..total_head)?;
+    let tail_delta = data.get(total_head..)?;
+    let tail = invert_periodic_delta(tail_delta, tail_delta_period)?;
+    let mut merged = Vec::with_capacity(original_len);
+    merged.extend_from_slice(head_stream);
+    merged.extend_from_slice(&tail);
+    invert_periodic_head_tail(&merged, original_len, period, 1)
+}
+
+fn apply_head_tail_tail_xor(data: &[u8], period: usize, tail_xor_period: usize) -> Option<Vec<u8>> {
+    let head_tail = apply_periodic_head_tail(data, period, 1)?;
+    let total_head = periodic_head_bytes(data.len(), period, 1)?;
+    let head_stream = head_tail.get(..total_head)?;
+    let tail_stream = head_tail.get(total_head..)?;
+    let tail_xor = apply_periodic_xor(tail_stream, tail_xor_period)?;
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(head_stream);
+    out.extend_from_slice(&tail_xor);
+    Some(out)
+}
+
+fn invert_head_tail_tail_xor(
+    data: &[u8],
+    original_len: usize,
+    period: usize,
+    tail_xor_period: usize,
+) -> Option<Vec<u8>> {
+    if data.len() != original_len {
+        return None;
+    }
+    let total_head = periodic_head_bytes(original_len, period, 1)?;
+    let head_stream = data.get(..total_head)?;
+    let tail_xor = data.get(total_head..)?;
+    let tail = invert_periodic_xor(tail_xor, tail_xor_period)?;
+    let mut merged = Vec::with_capacity(original_len);
+    merged.extend_from_slice(head_stream);
+    merged.extend_from_slice(&tail);
+    invert_periodic_head_tail(&merged, original_len, period, 1)
+}
+
 fn apply_transform_plan(data: &[u8], plan: &CircuitTransformPlan) -> Option<Vec<u8>> {
     match plan.kind {
         CircuitTransformKind::Identity => Some(data.to_vec()),
@@ -994,6 +1309,29 @@ fn apply_transform_plan(data: &[u8], plan: &CircuitTransformPlan) -> Option<Vec<
         CircuitTransformKind::XorPrev => Some(apply_unary_xor(data)),
         CircuitTransformKind::PeriodicHeadTail => {
             apply_periodic_head_tail(data, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicGather => apply_periodic_gather(data, plan.period as usize),
+        CircuitTransformKind::PeriodicDelta => apply_periodic_delta(data, plan.period as usize),
+        CircuitTransformKind::PeriodicXor => apply_periodic_xor(data, plan.period as usize),
+        CircuitTransformKind::PeriodicGatherDelta => {
+            let gathered = apply_periodic_gather(data, plan.period as usize)?;
+            Some(apply_unary_delta(&gathered))
+        }
+        CircuitTransformKind::PeriodicGatherXor => {
+            let gathered = apply_periodic_gather(data, plan.period as usize)?;
+            Some(apply_unary_xor(&gathered))
+        }
+        CircuitTransformKind::PeriodicHeadTailTailGather => {
+            apply_head_tail_tail_gather(data, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailTailGatherDelta => {
+            apply_head_tail_tail_gather_delta(data, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailTailDelta => {
+            apply_head_tail_tail_delta(data, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailTailXor => {
+            apply_head_tail_tail_xor(data, plan.period as usize, plan.head as usize)
         }
     }
 }
@@ -1024,6 +1362,52 @@ fn invert_transform_plan(data: &[u8], original_len: usize, plan: &CircuitTransfo
         CircuitTransformKind::PeriodicHeadTail => {
             invert_periodic_head_tail(data, original_len, plan.period as usize, plan.head as usize)
         }
+        CircuitTransformKind::PeriodicGather => {
+            invert_periodic_gather(data, original_len, plan.period as usize)
+        }
+        CircuitTransformKind::PeriodicDelta => {
+            if data.len() == original_len {
+                invert_periodic_delta(data, plan.period as usize)
+            } else {
+                None
+            }
+        }
+        CircuitTransformKind::PeriodicXor => {
+            if data.len() == original_len {
+                invert_periodic_xor(data, plan.period as usize)
+            } else {
+                None
+            }
+        }
+        CircuitTransformKind::PeriodicGatherDelta => {
+            if data.len() != original_len {
+                return None;
+            }
+            let recovered = invert_unary_delta(data);
+            invert_periodic_gather(&recovered, original_len, plan.period as usize)
+        }
+        CircuitTransformKind::PeriodicGatherXor => {
+            if data.len() != original_len {
+                return None;
+            }
+            let recovered = invert_unary_xor(data);
+            invert_periodic_gather(&recovered, original_len, plan.period as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailTailGather => {
+            invert_head_tail_tail_gather(data, original_len, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailTailGatherDelta => invert_head_tail_tail_gather_delta(
+            data,
+            original_len,
+            plan.period as usize,
+            plan.head as usize,
+        ),
+        CircuitTransformKind::PeriodicHeadTailTailDelta => {
+            invert_head_tail_tail_delta(data, original_len, plan.period as usize, plan.head as usize)
+        }
+        CircuitTransformKind::PeriodicHeadTailTailXor => {
+            invert_head_tail_tail_xor(data, original_len, plan.period as usize, plan.head as usize)
+        }
     }
 }
 
@@ -1043,6 +1427,76 @@ fn xz_decode_all(data: &[u8]) -> ZbitResult<Vec<u8>> {
         .read_to_end(&mut out)
         .map_err(|e| ZbitError::Parse(format!("xz decode failed: {e}")))?;
     Ok(out)
+}
+
+fn zstd_encode_with_level(data: &[u8], level: i32) -> ZbitResult<Vec<u8>> {
+    zstd_stream::encode_all(data, level).map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
+}
+
+fn zstd_decode_exact(data: &[u8], expected_len: usize) -> ZbitResult<Vec<u8>> {
+    let out = zstd_stream::decode_all(data).map_err(|e| ZbitError::Parse(format!("zstd decode failed: {e}")))?;
+    if out.len() != expected_len {
+        return Err(ZbitError::Parse(format!(
+            "zstd output length mismatch: expected {expected_len} got {}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+fn decode_with_codec(data: &[u8], codec: PayloadCodec, expected_len: usize) -> ZbitResult<Vec<u8>> {
+    match codec {
+        PayloadCodec::Raw => {
+            if data.len() != expected_len {
+                return Err(ZbitError::Parse(format!(
+                    "raw codec length mismatch: expected {expected_len} got {}",
+                    data.len()
+                )));
+            }
+            Ok(data.to_vec())
+        }
+        PayloadCodec::Xz | PayloadCodec::XzExtreme => {
+            let out = xz_decode_all(data)?;
+            if out.len() != expected_len {
+                return Err(ZbitError::Parse(format!(
+                    "xz output length mismatch: expected {expected_len} got {}",
+                    out.len()
+                )));
+            }
+            Ok(out)
+        }
+        PayloadCodec::Zstd => zstd_decode_exact(data, expected_len),
+    }
+}
+
+fn choose_best_codec(data: &[u8], allow_raw: bool, allow_xz_extreme: bool) -> ZbitResult<(PayloadCodec, Vec<u8>)> {
+    let mut best_codec = PayloadCodec::Raw;
+    let mut best_bytes = if allow_raw { data.to_vec() } else { Vec::new() };
+    let mut best_len = if allow_raw { best_bytes.len() } else { usize::MAX };
+
+    let xz = xz_encode_with_preset(data, 9)?;
+    if xz.len() < best_len {
+        best_len = xz.len();
+        best_codec = PayloadCodec::Xz;
+        best_bytes = xz;
+    }
+
+    if allow_xz_extreme {
+        let xz_extreme = xz_encode_with_preset(data, (1u32 << 31) | 9)?;
+        if xz_extreme.len() < best_len {
+            best_len = xz_extreme.len();
+            best_codec = PayloadCodec::XzExtreme;
+            best_bytes = xz_extreme;
+        }
+    }
+
+    let zstd = zstd_encode_with_level(data, 19)?;
+    if zstd.len() < best_len {
+        best_codec = PayloadCodec::Zstd;
+        best_bytes = zstd;
+    }
+
+    Ok((best_codec, best_bytes))
 }
 
 fn score_periodic_candidates(data: &[u8], max_period: usize, top_k: usize) -> Vec<usize> {
@@ -1083,86 +1537,172 @@ fn score_periodic_candidates(data: &[u8], max_period: usize, top_k: usize) -> Ve
     scored.into_iter().map(|(p, _)| p).collect()
 }
 
-fn build_topology_for_plan(plan: &CircuitTransformPlan) -> Vec<CircuitTopologyNode> {
-    let mut nodes = Vec::new();
+const TOPOLOGY_HASH_OFFSET: u64 = 0xcbf29ce484222325;
+const TOPOLOGY_HASH_PRIME: u64 = 0x100000001b3;
+
+fn topology_hash_mix(mut state: u64, value: u64) -> u64 {
+    state ^= value;
+    state.wrapping_mul(TOPOLOGY_HASH_PRIME)
+}
+
+fn finalize_topology_hashes(nodes: &mut [CircuitTopologyNode]) -> ZbitResult<()> {
+    let mut hash_by_id = HashMap::<u32, u64>::new();
+    for node in nodes.iter_mut() {
+        let parent_hash = if node.parent_id == u32::MAX {
+            TOPOLOGY_HASH_OFFSET
+        } else {
+            *hash_by_id.get(&node.parent_id).ok_or_else(|| {
+                ZbitError::Internal("topology contains child before parent".to_string())
+            })?
+        };
+        let mut hash = TOPOLOGY_HASH_OFFSET;
+        hash = topology_hash_mix(hash, parent_hash);
+        hash = topology_hash_mix(hash, node.id as u64);
+        hash = topology_hash_mix(hash, node.parent_id as u64);
+        hash = topology_hash_mix(hash, node.relation as u64);
+        hash = topology_hash_mix(hash, node.order as u64);
+        hash = topology_hash_mix(hash, node.kind as u64);
+        hash = topology_hash_mix(hash, node.param_a as u64);
+        hash = topology_hash_mix(hash, node.param_b as u64);
+        node.hash64 = hash;
+        hash_by_id.insert(node.id, hash);
+    }
+    Ok(())
+}
+
+fn push_topology_node(
+    nodes: &mut Vec<CircuitTopologyNode>,
+    parent_id: u32,
+    relation: u8,
+    order: u16,
+    kind: u8,
+    param_a: u32,
+    param_b: u32,
+) -> u32 {
+    let id = (nodes.len() as u32).saturating_add(1);
     nodes.push(CircuitTopologyNode {
-        id: 1,
-        parent_id: u32::MAX,
-        relation: 0,
-        order: 0,
-        kind: 0, // input-root
-        param_a: 0,
-        param_b: 0,
+        id,
+        parent_id,
+        relation,
+        order,
+        kind,
+        param_a,
+        param_b,
+        hash64: 0,
     });
+    id
+}
+
+fn build_topology_for_plan(plan: &CircuitTransformPlan) -> ZbitResult<Vec<CircuitTopologyNode>> {
+    let mut nodes = Vec::new();
+    let root_id = push_topology_node(&mut nodes, u32::MAX, 0, 0, 0, 0, 0);
 
     match plan.kind {
         CircuitTransformKind::Identity => {
-            nodes.push(CircuitTopologyNode {
-                id: 2,
-                parent_id: 1,
-                relation: 0,
-                order: 0,
-                kind: 1, // identity
-                param_a: 0,
-                param_b: 0,
-            });
+            let _ = push_topology_node(&mut nodes, root_id, 0, 0, 1, 0, 0);
         }
         CircuitTransformKind::DeltaPrev => {
-            nodes.push(CircuitTopologyNode {
-                id: 2,
-                parent_id: 1,
-                relation: 0,
-                order: 0,
-                kind: 2, // delta
-                param_a: 1,
-                param_b: 0,
-            });
+            let _ = push_topology_node(&mut nodes, root_id, 0, 0, 2, 1, 0);
         }
         CircuitTransformKind::XorPrev => {
-            nodes.push(CircuitTopologyNode {
-                id: 2,
-                parent_id: 1,
-                relation: 0,
-                order: 0,
-                kind: 3, // xor
-                param_a: 1,
-                param_b: 0,
-            });
+            let _ = push_topology_node(&mut nodes, root_id, 0, 0, 3, 1, 0);
         }
         CircuitTransformKind::PeriodicHeadTail => {
-            nodes.push(CircuitTopologyNode {
-                id: 2,
-                parent_id: 1,
-                relation: 0,
-                order: 0,
-                kind: 4, // periodic-head-tail
-                param_a: plan.period,
-                param_b: plan.head,
-            });
-            nodes.push(CircuitTopologyNode {
-                id: 3,
-                parent_id: 2,
-                relation: 1,
-                order: 0,
-                kind: 5, // head-substream
-                param_a: plan.head,
-                param_b: 0,
-            });
-            nodes.push(CircuitTopologyNode {
-                id: 4,
-                parent_id: 2,
-                relation: 1,
-                order: 1,
-                kind: 6, // tail-substream
-                param_a: plan.period.saturating_sub(plan.head),
-                param_b: 0,
-            });
+            let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, plan.head);
+            let _ = push_topology_node(&mut nodes, split_id, 1, 0, 10, plan.head, 0);
+            let _ = push_topology_node(
+                &mut nodes,
+                split_id,
+                1,
+                1,
+                11,
+                plan.period.saturating_sub(plan.head),
+                0,
+            );
+        }
+        CircuitTransformKind::PeriodicGather => {
+            let _ = push_topology_node(&mut nodes, root_id, 0, 0, 5, plan.period, 0);
+        }
+        CircuitTransformKind::PeriodicDelta => {
+            let _ = push_topology_node(&mut nodes, root_id, 0, 0, 6, plan.period, 0);
+        }
+        CircuitTransformKind::PeriodicXor => {
+            let _ = push_topology_node(&mut nodes, root_id, 0, 0, 7, plan.period, 0);
+        }
+        CircuitTransformKind::PeriodicGatherDelta => {
+            let gather_id = push_topology_node(&mut nodes, root_id, 0, 0, 5, plan.period, 0);
+            let _ = push_topology_node(&mut nodes, gather_id, 0, 0, 12, 1, 0);
+        }
+        CircuitTransformKind::PeriodicGatherXor => {
+            let gather_id = push_topology_node(&mut nodes, root_id, 0, 0, 5, plan.period, 0);
+            let _ = push_topology_node(&mut nodes, gather_id, 0, 0, 13, 1, 0);
+        }
+        CircuitTransformKind::PeriodicHeadTailTailGather => {
+            let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, 1);
+            let _ = push_topology_node(&mut nodes, split_id, 1, 0, 10, 1, 0);
+            let tail_id = push_topology_node(
+                &mut nodes,
+                split_id,
+                1,
+                1,
+                11,
+                plan.period.saturating_sub(1),
+                0,
+            );
+            let _ = push_topology_node(&mut nodes, tail_id, 0, 0, 14, plan.head, 0);
+        }
+        CircuitTransformKind::PeriodicHeadTailTailGatherDelta => {
+            let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, 1);
+            let _ = push_topology_node(&mut nodes, split_id, 1, 0, 10, 1, 0);
+            let tail_id = push_topology_node(
+                &mut nodes,
+                split_id,
+                1,
+                1,
+                11,
+                plan.period.saturating_sub(1),
+                0,
+            );
+            let gather_id = push_topology_node(&mut nodes, tail_id, 0, 0, 14, plan.head, 0);
+            let _ = push_topology_node(&mut nodes, gather_id, 0, 0, 12, 1, 0);
+        }
+        CircuitTransformKind::PeriodicHeadTailTailDelta => {
+            let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, 1);
+            let _ = push_topology_node(&mut nodes, split_id, 1, 0, 10, 1, 0);
+            let tail_id = push_topology_node(
+                &mut nodes,
+                split_id,
+                1,
+                1,
+                11,
+                plan.period.saturating_sub(1),
+                0,
+            );
+            let _ = push_topology_node(&mut nodes, tail_id, 0, 0, 15, plan.head, 0);
+        }
+        CircuitTransformKind::PeriodicHeadTailTailXor => {
+            let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, 1);
+            let _ = push_topology_node(&mut nodes, split_id, 1, 0, 10, 1, 0);
+            let tail_id = push_topology_node(
+                &mut nodes,
+                split_id,
+                1,
+                1,
+                11,
+                plan.period.saturating_sub(1),
+                0,
+            );
+            let _ = push_topology_node(&mut nodes, tail_id, 0, 0, 16, plan.head, 0);
         }
     }
-    nodes
+
+    finalize_topology_hashes(&mut nodes)?;
+    Ok(nodes)
 }
 
-fn choose_adaptive_transform_plan(data: &[u8]) -> ZbitResult<(CircuitTransformPlan, Vec<CircuitTopologyNode>, Vec<u8>)> {
+fn choose_adaptive_transform_plan(
+    data: &[u8],
+) -> ZbitResult<(CircuitTransformPlan, Vec<CircuitTopologyNode>, PayloadCodec, Vec<u8>)> {
     let mut plans = vec![
         CircuitTransformPlan {
             kind: CircuitTransformKind::Identity,
@@ -1181,8 +1721,15 @@ fn choose_adaptive_transform_plan(data: &[u8]) -> ZbitResult<(CircuitTransformPl
         },
     ];
 
-    let mut period_candidates = score_periodic_candidates(data, 8192, 4);
-    period_candidates.extend([2usize, 4, 8, 16, 32, 64]);
+    let mut add_plan = |plan: CircuitTransformPlan| {
+        if !plans.iter().any(|p| *p == plan) {
+            plans.push(plan);
+        }
+    };
+
+    let high_corr_periods = score_periodic_candidates(data, 8192, 8);
+    let mut period_candidates = high_corr_periods.clone();
+    period_candidates.extend([2usize, 3, 4, 5, 8, 16, 32, 64, 128, 257, 512, 1024, 2048]);
     period_candidates.sort_unstable();
     period_candidates.dedup();
 
@@ -1190,48 +1737,192 @@ fn choose_adaptive_transform_plan(data: &[u8]) -> ZbitResult<(CircuitTransformPl
         if period < 2 || period > data.len() {
             continue;
         }
-        for &head in &[1u32] {
-            if head == 0 || head >= period as u32 {
-                continue;
+        let period_u32 = period as u32;
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicGather,
+            period: period_u32,
+            head: 0,
+        });
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicDelta,
+            period: period_u32,
+            head: 0,
+        });
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicXor,
+            period: period_u32,
+            head: 0,
+        });
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicGatherDelta,
+            period: period_u32,
+            head: 0,
+        });
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicGatherXor,
+            period: period_u32,
+            head: 0,
+        });
+
+        add_plan(CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicHeadTail,
+            period: period_u32,
+            head: 1,
+        });
+        for tail_gather_period in [2u32, 4, 8] {
+            if (period_u32.saturating_sub(1)) >= tail_gather_period && tail_gather_period >= 2 {
+                add_plan(CircuitTransformPlan {
+                    kind: CircuitTransformKind::PeriodicHeadTailTailGather,
+                    period: period_u32,
+                    head: tail_gather_period,
+                });
+                add_plan(CircuitTransformPlan {
+                    kind: CircuitTransformKind::PeriodicHeadTailTailGatherDelta,
+                    period: period_u32,
+                    head: tail_gather_period,
+                });
             }
-            plans.push(CircuitTransformPlan {
+        }
+        for tail_delta_period in [2u32, 4, 8, 16] {
+            if (period_u32.saturating_sub(1)) >= tail_delta_period && tail_delta_period >= 2 {
+                add_plan(CircuitTransformPlan {
+                    kind: CircuitTransformKind::PeriodicHeadTailTailDelta,
+                    period: period_u32,
+                    head: tail_delta_period,
+                });
+                add_plan(CircuitTransformPlan {
+                    kind: CircuitTransformKind::PeriodicHeadTailTailXor,
+                    period: period_u32,
+                    head: tail_delta_period,
+                });
+            }
+        }
+        if period > 4 {
+            add_plan(CircuitTransformPlan {
                 kind: CircuitTransformKind::PeriodicHeadTail,
-                period: period as u32,
-                head,
+                period: period_u32,
+                head: 2,
             });
         }
-    }
-
-    let mut scored = Vec::<(usize, usize, Vec<u8>)>::new(); // (plan_idx, score_size, transformed)
-    for (idx, plan) in plans.iter().enumerate() {
-        let Some(transformed) = apply_transform_plan(data, plan) else {
-            continue;
-        };
-        let quick = xz_encode_with_preset(&transformed, 3)?;
-        scored.push((idx, quick.len(), transformed));
-    }
-    scored.sort_unstable_by_key(|entry| entry.1);
-    scored.truncate(2);
-
-    let mut best: Option<(CircuitTransformPlan, Vec<CircuitTopologyNode>, Vec<u8>, usize)> = None;
-    for (idx, _, transformed) in scored.into_iter() {
-        let final_payload = xz_encode_with_preset(&transformed, 9)?;
-        let size = final_payload.len();
-        let plan = plans[idx].clone();
-        let topo = build_topology_for_plan(&plan);
-        match &best {
-            Some((_, _, _, best_size)) if *best_size <= size => {}
-            _ => best = Some((plan, topo, final_payload, size)),
+        if period > 8 {
+            let half = (period / 2) as u32;
+            if half > 0 && half < period_u32 {
+                add_plan(CircuitTransformPlan {
+                    kind: CircuitTransformKind::PeriodicHeadTail,
+                    period: period_u32,
+                    head: half,
+                });
+            }
         }
     }
 
-    let (plan, topology, encoded, _) = best.ok_or_else(|| {
+    let sample_len = data.len().min(512 * 1024);
+    let sample = &data[..sample_len];
+
+    let mut scored = Vec::<(CircuitTransformPlan, usize)>::new();
+    for plan in &plans {
+        let Some(transformed_sample) = apply_transform_plan(sample, &plan) else {
+            continue;
+        };
+        let quick = zstd_encode_with_level(&transformed_sample, 1)?.len();
+        scored.push((*plan, quick));
+    }
+    scored.sort_unstable_by_key(|entry| entry.1);
+    let mut selected = Vec::<CircuitTransformPlan>::new();
+    let mut selected_set = HashSet::<CircuitTransformPlan>::new();
+    for (plan, _) in scored.iter().take(8) {
+        if selected_set.insert(*plan) {
+            selected.push(*plan);
+        }
+    }
+
+    for (idx, period) in high_corr_periods.into_iter().take(2).enumerate() {
+        let plan = CircuitTransformPlan {
+            kind: CircuitTransformKind::PeriodicHeadTail,
+            period: period as u32,
+            head: 1,
+        };
+        if selected_set.insert(plan) {
+            selected.push(plan);
+        }
+        if idx == 0 {
+            for forced_kind in [
+                CircuitTransformKind::PeriodicHeadTailTailDelta,
+                CircuitTransformKind::PeriodicHeadTailTailGather,
+            ] {
+                let forced = CircuitTransformPlan {
+                    kind: forced_kind,
+                    period: period as u32,
+                    head: 4,
+                };
+                if selected_set.insert(forced) {
+                    selected.push(forced);
+                }
+            }
+        }
+    }
+
+    for baseline in [
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::Identity,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::DeltaPrev,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::XorPrev,
+            period: 0,
+            head: 0,
+        },
+    ] {
+        if selected_set.insert(baseline) {
+            selected.push(baseline);
+        }
+    }
+
+    let mut best: Option<(CircuitTransformPlan, Vec<CircuitTopologyNode>, PayloadCodec, Vec<u8>, usize)> = None;
+    let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
+    for plan in selected {
+        let Some(transformed) = apply_transform_plan(data, &plan) else {
+            continue;
+        };
+        let (codec, final_payload) = choose_best_codec(&transformed, true, false)?;
+        let size = final_payload.len();
+        if trace_recursive {
+            eprintln!(
+                "zbit-trace plan-candidate kind={} period={} head={} encoded={} codec={}",
+                plan.kind.name(),
+                plan.period,
+                plan.head,
+                size,
+                codec.name()
+            );
+        }
+        let topology = build_topology_for_plan(&plan)?;
+        match &best {
+            Some((_, _, _, _, best_size)) if *best_size <= size => {}
+            _ => best = Some((plan, topology, codec, final_payload, size)),
+        }
+    }
+
+    let (plan, topology, mut codec, mut encoded, _) = best.ok_or_else(|| {
         ZbitError::Internal("failed to evaluate adaptive transform plans".to_string())
     })?;
-    Ok((plan, topology, encoded))
+    if let Some(transformed) = apply_transform_plan(data, &plan) {
+        let xz_extreme = xz_encode_with_preset(&transformed, (1u32 << 31) | 9)?;
+        if xz_extreme.len() < encoded.len() {
+            codec = PayloadCodec::XzExtreme;
+            encoded = xz_extreme;
+        }
+    }
+    Ok((plan, topology, codec, encoded))
 }
 
-fn build_png_preflate_stream(_input: &[u8], base: &PngIdatStream) -> ZbitResult<Option<PngPreflateStream>> {
+fn build_recursive_circuit_stream(_input: &[u8], base: &FramedPayloadRun) -> ZbitResult<Option<RecursiveCircuitStream>> {
 
     if base.payload.len() < 6 {
         return Ok(None);
@@ -1253,19 +1944,39 @@ fn build_png_preflate_stream(_input: &[u8], base: &PngIdatStream) -> ZbitResult<
     };
 
     let plain_bytes = plain.text();
-    let (transform_plan, topology, transformed_payload) = choose_adaptive_transform_plan(plain_bytes)?;
+    let (transform_plan, topology, transformed_codec, transformed_payload) =
+        choose_adaptive_transform_plan(plain_bytes)?;
     let corrections = chunk.corrections;
+    let (correction_codec, corrections_payload) = choose_best_codec(&corrections, true, false)?;
     let plain_len = plain_bytes.len();
-    let transformed_len = transformed_payload.len();
-    let correction_len = corrections.len();
+    let transformed_encoded_len = transformed_payload.len();
+    let correction_plain_len = corrections.len();
+    let correction_encoded_len = corrections_payload.len();
 
-    Ok(Some(PngPreflateStream {
+    if std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some() {
+        eprintln!(
+            "zbit-trace recursive plan={} period={} head={} transformed={}({}) corrections={}({}) corr-plain={}",
+            transform_plan.kind.name(),
+            transform_plan.period,
+            transform_plan.head,
+            transformed_encoded_len,
+            transformed_codec.name(),
+            correction_encoded_len,
+            correction_codec.name(),
+            correction_plain_len
+        );
+    }
+
+    Ok(Some(RecursiveCircuitStream {
         base: base.clone(),
         transformed_payload,
-        corrections,
+        corrections_payload,
         plain_len,
-        transformed_len,
-        correction_len,
+        transformed_encoded_len,
+        correction_plain_len,
+        correction_encoded_len,
+        transformed_codec,
+        correction_codec,
         zlib_header,
         zlib_adler32,
         transform_plan,
@@ -1273,17 +1984,20 @@ fn build_png_preflate_stream(_input: &[u8], base: &PngIdatStream) -> ZbitResult<
     }))
 }
 
-fn png_preflate_dictionary_size(stream: &PngPreflateStream) -> usize {
-    png_idat_dictionary_size(&stream.base) + 41 + stream.topology.len() * 20
+fn recursive_circuit_dictionary_size(stream: &RecursiveCircuitStream) -> usize {
+    framed_dictionary_size(&stream.base) + 51 + stream.topology.len() * 28
 }
 
-fn write_png_preflate_dictionary(out: &mut Vec<u8>, stream: &PngPreflateStream) {
-    write_png_idat_dictionary(out, &stream.base);
+fn write_recursive_circuit_dictionary(out: &mut Vec<u8>, stream: &RecursiveCircuitStream) {
+    write_framed_dictionary(out, &stream.base);
     out.extend_from_slice(&stream.zlib_header);
     out.extend_from_slice(&stream.zlib_adler32);
     push_u64(out, stream.plain_len as u64);
-    push_u64(out, stream.transformed_len as u64);
-    push_u64(out, stream.correction_len as u64);
+    push_u64(out, stream.transformed_encoded_len as u64);
+    push_u64(out, stream.correction_plain_len as u64);
+    push_u64(out, stream.correction_encoded_len as u64);
+    out.push(stream.transformed_codec.as_u8());
+    out.push(stream.correction_codec.as_u8());
     out.push(stream.transform_plan.kind.as_u8());
     push_u32(out, stream.transform_plan.period);
     push_u32(out, stream.transform_plan.head);
@@ -1296,10 +2010,11 @@ fn write_png_preflate_dictionary(out: &mut Vec<u8>, stream: &PngPreflateStream) 
         out.push(node.kind);
         push_u32(out, node.param_a);
         push_u32(out, node.param_b);
+        push_u64(out, node.hash64);
     }
 }
 
-fn decode_png_preflate_payload(
+fn decode_recursive_circuit_payload(
     dict_bytes: &[u8],
     payload: &[u8],
     original_size: usize,
@@ -1307,6 +2022,11 @@ fn decode_png_preflate_payload(
     let mut dict_cursor = 0usize;
     let prefix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
     let suffix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tag_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 4)
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz missing frame tag".to_string()))?;
+    dict_cursor += 4;
+    let frame_tag = [tag_slice[0], tag_slice[1], tag_slice[2], tag_slice[3]];
     let base_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
     let full_chunk_count = read_u32(dict_bytes, &mut dict_cursor)? as usize;
     let tail_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
@@ -1314,34 +2034,39 @@ fn decode_png_preflate_payload(
 
     let prefix = dict_bytes
         .get(dict_cursor..dict_cursor + prefix_len)
-        .ok_or_else(|| ZbitError::Parse("png-preflate-xz prefix range out of bounds".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz prefix range out of bounds".to_string()))?;
     dict_cursor += prefix_len;
 
     let suffix = dict_bytes
         .get(dict_cursor..dict_cursor + suffix_len)
-        .ok_or_else(|| ZbitError::Parse("png-preflate-xz suffix range out of bounds".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz suffix range out of bounds".to_string()))?;
     dict_cursor += suffix_len;
 
     let zlib_header_slice = dict_bytes
         .get(dict_cursor..dict_cursor + 2)
-        .ok_or_else(|| ZbitError::Parse("png-preflate-xz missing zlib header".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz missing zlib header".to_string()))?;
     dict_cursor += 2;
     let mut zlib_header = [0u8; 2];
     zlib_header.copy_from_slice(zlib_header_slice);
 
     let zlib_adler_slice = dict_bytes
         .get(dict_cursor..dict_cursor + 4)
-        .ok_or_else(|| ZbitError::Parse("png-preflate-xz missing zlib adler32".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz missing zlib adler32".to_string()))?;
     dict_cursor += 4;
     let mut zlib_adler32 = [0u8; 4];
     zlib_adler32.copy_from_slice(zlib_adler_slice);
 
     let plain_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
-    let transformed_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
-    let correction_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let transformed_encoded_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let correction_plain_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let correction_encoded_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let transformed_codec = PayloadCodec::from_u8(read_u8(dict_bytes, &mut dict_cursor)?)
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz dictionary has invalid transformed codec".to_string()))?;
+    let correction_codec = PayloadCodec::from_u8(read_u8(dict_bytes, &mut dict_cursor)?)
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz dictionary has invalid correction codec".to_string()))?;
     let transform_kind_u8 = read_u8(dict_bytes, &mut dict_cursor)?;
     let transform_kind = CircuitTransformKind::from_u8(transform_kind_u8).ok_or_else(|| {
-        ZbitError::Parse("png-preflate-xz dictionary has invalid transform kind".to_string())
+        ZbitError::Parse("recursive-circuit-xz dictionary has invalid transform kind".to_string())
     })?;
     let transform_period = read_u32(dict_bytes, &mut dict_cursor)?;
     let transform_head = read_u32(dict_bytes, &mut dict_cursor)?;
@@ -1349,76 +2074,101 @@ fn decode_png_preflate_payload(
 
     let mut seen_root = false;
     let mut last_id = 0u32;
+    let mut hash_by_id = HashMap::<u32, u64>::new();
     for idx in 0..topology_count {
         let id = read_u32(dict_bytes, &mut dict_cursor)?;
         let parent_id = read_u32(dict_bytes, &mut dict_cursor)?;
         let relation = read_u8(dict_bytes, &mut dict_cursor)?;
-        let _order = read_u16(dict_bytes, &mut dict_cursor)?;
-        let _kind = read_u8(dict_bytes, &mut dict_cursor)?;
-        let _param_a = read_u32(dict_bytes, &mut dict_cursor)?;
-        let _param_b = read_u32(dict_bytes, &mut dict_cursor)?;
+        let order = read_u16(dict_bytes, &mut dict_cursor)?;
+        let kind = read_u8(dict_bytes, &mut dict_cursor)?;
+        let param_a = read_u32(dict_bytes, &mut dict_cursor)?;
+        let param_b = read_u32(dict_bytes, &mut dict_cursor)?;
+        let stored_hash = read_u64(dict_bytes, &mut dict_cursor)?;
 
         if relation > 1 {
             return Err(ZbitError::Parse(
-                "png-preflate-xz topology relation must be 0 or 1".to_string(),
+                "recursive-circuit-xz topology relation must be 0 or 1".to_string(),
             ));
         }
         if idx > 0 && id <= last_id {
             return Err(ZbitError::Parse(
-                "png-preflate-xz topology node ids must be strictly increasing".to_string(),
+                "recursive-circuit-xz topology node ids must be strictly increasing".to_string(),
             ));
         }
         if parent_id == u32::MAX {
             seen_root = true;
         }
+        let parent_hash = if parent_id == u32::MAX {
+            TOPOLOGY_HASH_OFFSET
+        } else {
+            *hash_by_id.get(&parent_id).ok_or_else(|| {
+                ZbitError::Parse("recursive-circuit-xz topology references unknown parent".to_string())
+            })?
+        };
+        let mut expected_hash = TOPOLOGY_HASH_OFFSET;
+        expected_hash = topology_hash_mix(expected_hash, parent_hash);
+        expected_hash = topology_hash_mix(expected_hash, id as u64);
+        expected_hash = topology_hash_mix(expected_hash, parent_id as u64);
+        expected_hash = topology_hash_mix(expected_hash, relation as u64);
+        expected_hash = topology_hash_mix(expected_hash, order as u64);
+        expected_hash = topology_hash_mix(expected_hash, kind as u64);
+        expected_hash = topology_hash_mix(expected_hash, param_a as u64);
+        expected_hash = topology_hash_mix(expected_hash, param_b as u64);
+        if stored_hash != expected_hash {
+            return Err(ZbitError::Parse(
+                "recursive-circuit-xz topology hash mismatch".to_string(),
+            ));
+        }
+        hash_by_id.insert(id, expected_hash);
         last_id = id;
     }
 
     if dict_cursor != dict_bytes.len() {
         return Err(ZbitError::Parse(
-            "trailing bytes in png-preflate-xz dictionary".to_string(),
+            "trailing bytes in recursive-circuit-xz dictionary".to_string(),
         ));
     }
     if topology_count == 0 || !seen_root {
         return Err(ZbitError::Parse(
-            "png-preflate-xz topology metadata missing valid root".to_string(),
+            "recursive-circuit-xz topology metadata missing valid root".to_string(),
         ));
     }
 
-    let expected_payload = transformed_len
-        .checked_add(correction_len)
-        .ok_or_else(|| ZbitError::Parse("png-preflate-xz payload length overflow".to_string()))?;
+    let expected_payload = transformed_encoded_len
+        .checked_add(correction_encoded_len)
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz payload length overflow".to_string()))?;
     if payload.len() != expected_payload {
         return Err(ZbitError::Parse(format!(
-            "png-preflate-xz payload length mismatch: expected {expected_payload} got {}",
+            "recursive-circuit-xz payload length mismatch: expected {expected_payload} got {}",
             payload.len()
         )));
     }
 
-    let transformed_payload = &payload[..transformed_len];
-    let corrections = &payload[transformed_len..];
-    let transformed = xz_decode_all(transformed_payload)?;
+    let transformed_payload = &payload[..transformed_encoded_len];
+    let corrections_payload = &payload[transformed_encoded_len..];
+    let transformed = decode_with_codec(transformed_payload, transformed_codec, plain_len)?;
+    let corrections = decode_with_codec(corrections_payload, correction_codec, correction_plain_len)?;
     let plan = CircuitTransformPlan {
         kind: transform_kind,
         period: transform_period,
         head: transform_head,
     };
     let filtered_plain = invert_transform_plan(&transformed, plain_len, &plan).ok_or_else(|| {
-        ZbitError::Parse("png-preflate-xz transformed stream is invalid".to_string())
+        ZbitError::Parse("recursive-circuit-xz transformed stream is invalid".to_string())
     })?;
 
-    let deflate_stream = recreate_whole_deflate_stream(&filtered_plain, corrections)
+    let deflate_stream = recreate_whole_deflate_stream(&filtered_plain, &corrections)
         .map_err(|e| ZbitError::Parse(format!("preflate recreate failed: {e}")))?;
 
-    let mut idat_payload = Vec::with_capacity(
+    let mut framed_payload = Vec::with_capacity(
         2usize
             .checked_add(deflate_stream.len())
             .and_then(|v| v.checked_add(4))
-            .ok_or_else(|| ZbitError::Parse("png-preflate-xz idat payload overflow".to_string()))?,
+            .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz framed payload overflow".to_string()))?,
     );
-    idat_payload.extend_from_slice(&zlib_header);
-    idat_payload.extend_from_slice(&deflate_stream);
-    idat_payload.extend_from_slice(&zlib_adler32);
+    framed_payload.extend_from_slice(&zlib_header);
+    framed_payload.extend_from_slice(&deflate_stream);
+    framed_payload.extend_from_slice(&zlib_adler32);
 
     let tail_present = if total_chunks == full_chunk_count {
         false
@@ -1426,31 +2176,31 @@ fn decode_png_preflate_payload(
         true
     } else {
         return Err(ZbitError::Parse(
-            "png-preflate-xz dictionary has inconsistent chunk counters".to_string(),
+            "recursive-circuit-xz dictionary has inconsistent chunk counters".to_string(),
         ));
     };
 
-    let expected_idat_payload = full_chunk_count
+    let expected_framed_payload = full_chunk_count
         .checked_mul(base_chunk_len)
         .and_then(|v| if tail_present { v.checked_add(tail_chunk_len) } else { Some(v) })
-        .ok_or_else(|| ZbitError::Parse("png-preflate-xz idat length overflow".to_string()))?;
-    if idat_payload.len() != expected_idat_payload {
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz framed length overflow".to_string()))?;
+    if framed_payload.len() != expected_framed_payload {
         return Err(ZbitError::Parse(format!(
-            "png-preflate-xz idat length mismatch: expected {expected_idat_payload} got {}",
-            idat_payload.len()
+            "recursive-circuit-xz framed length mismatch: expected {expected_framed_payload} got {}",
+            framed_payload.len()
         )));
     }
 
     let chunk_overhead = total_chunks
         .checked_mul(12)
-        .ok_or_else(|| ZbitError::Parse("png-preflate-xz chunk overhead overflow".to_string()))?;
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz chunk overhead overflow".to_string()))?;
     let mut out = Vec::with_capacity(
         prefix
             .len()
-            .checked_add(idat_payload.len())
+            .checked_add(framed_payload.len())
             .and_then(|v| v.checked_add(suffix.len()))
             .and_then(|v| v.checked_add(chunk_overhead))
-            .ok_or_else(|| ZbitError::Parse("png-preflate-xz output length overflow".to_string()))?,
+            .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz output length overflow".to_string()))?,
     );
     out.extend_from_slice(prefix);
 
@@ -1461,17 +2211,17 @@ fn decode_png_preflate_payload(
         } else {
             tail_chunk_len
         };
-        let chunk_data = idat_payload
+        let chunk_data = framed_payload
             .get(payload_cursor..payload_cursor + chunk_len)
-            .ok_or_else(|| ZbitError::Parse("png-preflate-xz idat range out of bounds".to_string()))?;
+            .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz frame range out of bounds".to_string()))?;
         payload_cursor += chunk_len;
 
         push_u32_be(&mut out, chunk_len as u32);
-        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(&frame_tag);
         out.extend_from_slice(chunk_data);
 
         let mut hasher = Crc32Hasher::new();
-        hasher.update(b"IDAT");
+        hasher.update(&frame_tag);
         hasher.update(chunk_data);
         push_u32_be(&mut out, hasher.finalize());
     }
@@ -1480,7 +2230,7 @@ fn decode_png_preflate_payload(
 
     if out.len() != original_size {
         return Err(ZbitError::Parse(format!(
-            "png-preflate-xz output length mismatch: expected {original_size} got {}",
+            "recursive-circuit-xz output length mismatch: expected {original_size} got {}",
             out.len()
         )));
     }
@@ -1497,8 +2247,8 @@ fn write_pack_bytes(
     huffman_stream: Option<&HuffmanStream>,
     raw_deflate_payload: Option<&[u8]>,
     raw_zstd_payload: Option<&[u8]>,
-    png_idat_stream: Option<&PngIdatStream>,
-    png_preflate_stream: Option<&PngPreflateStream>,
+    framed_run: Option<&FramedPayloadRun>,
+    recursive_stream: Option<&RecursiveCircuitStream>,
 ) -> ZbitResult<Vec<u8>> {
     if stream.unique_symbols.len() > u16::MAX as usize {
         return Err(ZbitError::Limit(
@@ -1543,21 +2293,21 @@ fn write_pack_bytes(
             })?;
             (0u8, 0usize, 0usize, payload.len())
         }
-        PackMethod::PngIdatRaw => {
-            let png = png_idat_stream.ok_or_else(|| {
-                ZbitError::Internal("png-idat stream missing for png-idat-raw method".to_string())
+        PackMethod::FramedRaw => {
+            let run = framed_run.ok_or_else(|| {
+                ZbitError::Internal("framed-run missing for framed-raw method".to_string())
             })?;
-            (0u8, 0usize, png_idat_dictionary_size(png), png.payload.len())
+            (0u8, 0usize, framed_dictionary_size(run), run.payload.len())
         }
-        PackMethod::PngPreflateXz => {
-            let png = png_preflate_stream.ok_or_else(|| {
-                ZbitError::Internal("png-preflate stream missing for png-preflate-xz method".to_string())
+        PackMethod::RecursiveCircuitXz => {
+            let recursive = recursive_stream.ok_or_else(|| {
+                ZbitError::Internal("recursive stream missing for recursive-circuit-xz method".to_string())
             })?;
             (
                 0u8,
                 0usize,
-                png_preflate_dictionary_size(png),
-                png.transformed_len + png.correction_len,
+                recursive_circuit_dictionary_size(recursive),
+                recursive.transformed_encoded_len + recursive.correction_encoded_len,
             )
         }
     };
@@ -1612,17 +2362,17 @@ fn write_pack_bytes(
             }
         }
         PackMethod::RawDeflate | PackMethod::RawZstd => {}
-        PackMethod::PngIdatRaw => {
-            let png = png_idat_stream.ok_or_else(|| {
-                ZbitError::Internal("png-idat stream missing for png-idat-raw dictionary".to_string())
+        PackMethod::FramedRaw => {
+            let run = framed_run.ok_or_else(|| {
+                ZbitError::Internal("framed-run missing for framed-raw dictionary".to_string())
             })?;
-            write_png_idat_dictionary(&mut out, png);
+            write_framed_dictionary(&mut out, run);
         }
-        PackMethod::PngPreflateXz => {
-            let png = png_preflate_stream.ok_or_else(|| {
-                ZbitError::Internal("png-preflate stream missing for png-preflate-xz dictionary".to_string())
+        PackMethod::RecursiveCircuitXz => {
+            let recursive = recursive_stream.ok_or_else(|| {
+                ZbitError::Internal("recursive stream missing for recursive-circuit-xz dictionary".to_string())
             })?;
-            write_png_preflate_dictionary(&mut out, png);
+            write_recursive_circuit_dictionary(&mut out, recursive);
         }
     }
 
@@ -1647,18 +2397,18 @@ fn write_pack_bytes(
             })?;
             out.extend_from_slice(&payload);
         }
-        PackMethod::PngIdatRaw => {
-            let png = png_idat_stream.ok_or_else(|| {
-                ZbitError::Internal("png-idat stream missing for png-idat-raw payload".to_string())
+        PackMethod::FramedRaw => {
+            let run = framed_run.ok_or_else(|| {
+                ZbitError::Internal("framed-run missing for framed-raw payload".to_string())
             })?;
-            out.extend_from_slice(&png.payload);
+            out.extend_from_slice(&run.payload);
         }
-        PackMethod::PngPreflateXz => {
-            let png = png_preflate_stream.ok_or_else(|| {
-                ZbitError::Internal("png-preflate stream missing for png-preflate-xz payload".to_string())
+        PackMethod::RecursiveCircuitXz => {
+            let recursive = recursive_stream.ok_or_else(|| {
+                ZbitError::Internal("recursive stream missing for recursive-circuit-xz payload".to_string())
             })?;
-            out.extend_from_slice(&png.transformed_payload);
-            out.extend_from_slice(&png.corrections);
+            out.extend_from_slice(&recursive.transformed_payload);
+            out.extend_from_slice(&recursive.corrections_payload);
         }
     }
 
@@ -1679,17 +2429,22 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     let raw_deflate_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_deflate_payload.len());
     let raw_zstd_payload = build_raw_zstd_payload(input)?;
     let raw_zstd_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_zstd_payload.len());
-    let png_idat_stream = build_png_idat_stream(input);
-    let png_idat_raw_candidate_bytes = png_idat_stream
+    let framed_run = build_framed_payload_run(input);
+    let framed_raw_candidate_bytes = framed_run
         .as_ref()
-        .map(|png| ZBPK_HEADER_BYTES + png_idat_dictionary_size(png) + png.payload.len());
-    let png_preflate_stream = match png_idat_stream.as_ref() {
-        Some(png) => build_png_preflate_stream(input, png)?,
+        .map(|run| ZBPK_HEADER_BYTES + framed_dictionary_size(run) + run.payload.len());
+    let recursive_stream = match framed_run.as_ref() {
+        Some(run) => build_recursive_circuit_stream(input, run)?,
         None => None,
     };
-    let png_preflate_xz_candidate_bytes = png_preflate_stream
+    let recursive_circuit_xz_candidate_bytes = recursive_stream
         .as_ref()
-        .map(|png| ZBPK_HEADER_BYTES + png_preflate_dictionary_size(png) + png.transformed_len + png.correction_len);
+        .map(|recursive| {
+            ZBPK_HEADER_BYTES
+                + recursive_circuit_dictionary_size(recursive)
+                + recursive.transformed_encoded_len
+                + recursive.correction_encoded_len
+        });
 
     let mut eval = PackEvaluation::new();
     eval.original_size = input.len();
@@ -1701,8 +2456,8 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     eval.indexed_huffman_total_bytes = indexed_huffman_candidate_bytes;
     eval.raw_deflate_total_bytes = raw_deflate_candidate_bytes;
     eval.raw_zstd_total_bytes = raw_zstd_candidate_bytes;
-    eval.png_idat_raw_total_bytes = png_idat_raw_candidate_bytes;
-    eval.png_preflate_xz_total_bytes = png_preflate_xz_candidate_bytes;
+    eval.framed_raw_total_bytes = framed_raw_candidate_bytes;
+    eval.recursive_circuit_xz_total_bytes = recursive_circuit_xz_candidate_bytes;
 
     let (should_eval_circuit, circuit_rule_note) = should_evaluate_circuit(&eval);
 
@@ -1726,8 +2481,8 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         huffman_stream.as_ref(),
         Some(raw_deflate_payload.as_slice()),
         Some(raw_zstd_payload.as_slice()),
-        png_idat_stream.as_ref(),
-        png_preflate_stream.as_ref(),
+        framed_run.as_ref(),
+        recursive_stream.as_ref(),
     )?;
 
     fs::write(path.as_ref(), &pack_bytes)?;
@@ -1743,17 +2498,21 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         }
         PackMethod::RawDeflate => (0u8, raw_deflate_payload.len(), 0usize),
         PackMethod::RawZstd => (0u8, raw_zstd_payload.len(), 0usize),
-        PackMethod::PngIdatRaw => {
-            let png = png_idat_stream.as_ref().ok_or_else(|| {
-                ZbitError::Internal("png-idat-raw selected without png stream".to_string())
+        PackMethod::FramedRaw => {
+            let run = framed_run.as_ref().ok_or_else(|| {
+                ZbitError::Internal("framed-raw selected without framed run".to_string())
             })?;
-            (0u8, png.payload.len(), 0usize)
+            (0u8, run.payload.len(), 0usize)
         }
-        PackMethod::PngPreflateXz => {
-            let png = png_preflate_stream.as_ref().ok_or_else(|| {
-                ZbitError::Internal("png-preflate-xz selected without png-preflate stream".to_string())
+        PackMethod::RecursiveCircuitXz => {
+            let recursive = recursive_stream.as_ref().ok_or_else(|| {
+                ZbitError::Internal("recursive-circuit-xz selected without recursive stream".to_string())
             })?;
-            (0u8, png.transformed_len + png.correction_len, 0usize)
+            (
+                0u8,
+                recursive.transformed_encoded_len + recursive.correction_encoded_len,
+                0usize,
+            )
         }
     };
 
@@ -1772,8 +2531,8 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         indexed_huffman_candidate_bytes,
         raw_deflate_candidate_bytes,
         raw_zstd_candidate_bytes,
-        png_idat_raw_candidate_bytes,
-        png_preflate_xz_candidate_bytes,
+        framed_raw_candidate_bytes,
+        recursive_circuit_xz_candidate_bytes,
         chosen_method: eval.chosen_method,
         chosen_reason: eval.chosen_reason,
         circuit_rule_note,
@@ -1894,21 +2653,21 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
             }
             return decode_raw_zstd_payload(payload, original_size);
         }
-        PackMethod::PngIdatRaw => {
+        PackMethod::FramedRaw => {
             if bits_per_symbol != 0 || unique_count != 0 {
                 return Err(ZbitError::Parse(
-                    "png-idat-raw requires bits_per_symbol=0 and unique_count=0".to_string(),
+                    "framed-raw requires bits_per_symbol=0 and unique_count=0".to_string(),
                 ));
             }
-            return decode_png_idat_payload(dict, payload, original_size);
+            return decode_framed_payload(dict, payload, original_size);
         }
-        PackMethod::PngPreflateXz => {
+        PackMethod::RecursiveCircuitXz => {
             if bits_per_symbol != 0 || unique_count != 0 {
                 return Err(ZbitError::Parse(
-                    "png-preflate-xz requires bits_per_symbol=0 and unique_count=0".to_string(),
+                    "recursive-circuit-xz requires bits_per_symbol=0 and unique_count=0".to_string(),
                 ));
             }
-            return decode_png_preflate_payload(dict, payload, original_size);
+            return decode_recursive_circuit_payload(dict, payload, original_size);
         }
         PackMethod::IndexedHuffman => {
             if bits_per_symbol != 0 {
@@ -1936,8 +2695,8 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
         | PackMethod::IndexedHuffman
         | PackMethod::RawDeflate
         | PackMethod::RawZstd
-        | PackMethod::PngIdatRaw
-        | PackMethod::PngPreflateXz => {
+        | PackMethod::FramedRaw
+        | PackMethod::RecursiveCircuitXz => {
             unreachable!()
         }
     };
@@ -1991,7 +2750,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn append_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    fn append_crc_frame(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
         push_u32_be(out, data.len() as u32);
         out.extend_from_slice(chunk_type);
         out.extend_from_slice(data);
@@ -2001,19 +2760,9 @@ mod tests {
         push_u32_be(out, hasher.finalize());
     }
 
-    fn build_png_with_many_idat_chunks() -> Vec<u8> {
+    fn build_framed_container_with_many_frames() -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-
-        let mut ihdr = Vec::with_capacity(13);
-        ihdr.extend_from_slice(&1u32.to_be_bytes()); // width
-        ihdr.extend_from_slice(&1u32.to_be_bytes()); // height
-        ihdr.push(8); // bit depth
-        ihdr.push(6); // color type RGBA
-        ihdr.push(0); // compression
-        ihdr.push(0); // filter
-        ihdr.push(0); // interlace
-        append_png_chunk(&mut out, b"IHDR", &ihdr);
+        out.extend_from_slice(b"ZBIT-FRAMED-PREFIX");
 
         let full_chunk_len = 128usize;
         let full_chunks = 96usize;
@@ -2032,16 +2781,16 @@ mod tests {
         let mut cursor = 0usize;
         for _ in 0..full_chunks {
             let slice = &payload[cursor..cursor + full_chunk_len];
-            append_png_chunk(&mut out, b"IDAT", slice);
+            append_crc_frame(&mut out, b"DATA", slice);
             cursor += full_chunk_len;
         }
 
-        append_png_chunk(&mut out, b"IDAT", &payload[cursor..]);
-        append_png_chunk(&mut out, b"IEND", &[]);
+        append_crc_frame(&mut out, b"DATA", &payload[cursor..]);
+        out.extend_from_slice(b"ZBIT-FRAMED-SUFFIX");
         out
     }
 
-    fn build_valid_png_with_split_idat() -> (Vec<u8>, Vec<u8>) {
+    fn build_valid_framed_container_with_split_deflate() -> (Vec<u8>, Vec<u8>) {
         let width = 64u32;
         let height = 64u32;
 
@@ -2091,31 +2840,21 @@ mod tests {
 
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
         encoder.write_all(&filtered).expect("zlib write");
-        let idat_payload = encoder.finish().expect("zlib finish");
+        let framed_payload = encoder.finish().expect("zlib finish");
 
-        let mut png = Vec::new();
-        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-
-        let mut ihdr = Vec::with_capacity(13);
-        ihdr.extend_from_slice(&width.to_be_bytes());
-        ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.push(8);
-        ihdr.push(6);
-        ihdr.push(0);
-        ihdr.push(0);
-        ihdr.push(0);
-        append_png_chunk(&mut png, b"IHDR", &ihdr);
+        let mut container = Vec::new();
+        container.extend_from_slice(b"ZBIT-DEFLATE-PREFIX");
 
         let chunk = 1024usize;
         let mut cursor = 0usize;
-        while cursor < idat_payload.len() {
-            let end = (cursor + chunk).min(idat_payload.len());
-            append_png_chunk(&mut png, b"IDAT", &idat_payload[cursor..end]);
+        while cursor < framed_payload.len() {
+            let end = (cursor + chunk).min(framed_payload.len());
+            append_crc_frame(&mut container, b"DATA", &framed_payload[cursor..end]);
             cursor = end;
         }
 
-        append_png_chunk(&mut png, b"IEND", &[]);
-        (png, filtered)
+        container.extend_from_slice(b"ZBIT-DEFLATE-SUFFIX");
+        (container, filtered)
     }
 
     #[test]
@@ -2201,33 +2940,33 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_pack_evaluates_png_idat_raw_and_roundtrips() {
-        let input = build_png_with_many_idat_chunks();
+    fn adaptive_pack_evaluates_framed_raw_and_roundtrips() {
+        let input = build_framed_container_with_many_frames();
 
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("zbit_pack_png_idat_{stamp}.zbpk"));
+        let path = std::env::temp_dir().join(format!("zbit_pack_framed_{stamp}.zbpk"));
 
         let stats = compress_adaptive_to_file(&input, &path).expect("compress adaptive");
         let output = decompress_file(&path).expect("decompress adaptive");
         let _ = fs::remove_file(&path);
 
         assert_eq!(output, input);
-        let png_candidate = stats
-            .png_idat_raw_candidate_bytes
-            .expect("png-idat-raw candidate should be available");
+        let framed_candidate = stats
+            .framed_raw_candidate_bytes
+            .expect("framed-raw candidate should be available");
         assert!(
-            png_candidate < stats.raw_candidate_bytes,
-            "png-idat-raw should beat raw-copy on multi-IDAT input"
+            framed_candidate < stats.raw_candidate_bytes,
+            "framed-raw should beat raw-copy on multi-frame input"
         );
         assert!(stats.compressed_size <= stats.raw_candidate_bytes);
     }
 
     #[test]
-    fn png_preflate_transform_roundtrip() {
-        let (_png, filtered_plain) = build_valid_png_with_split_idat();
+    fn recursive_transform_roundtrip() {
+        let (_container, filtered_plain) = build_valid_framed_container_with_split_deflate();
         let plan = CircuitTransformPlan {
             kind: CircuitTransformKind::PeriodicHeadTail,
             period: 257,
@@ -2239,14 +2978,14 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_pack_evaluates_png_preflate_xz_candidate_and_roundtrips() {
-        let (input, _filtered_plain) = build_valid_png_with_split_idat();
+    fn adaptive_pack_evaluates_recursive_circuit_xz_candidate_and_roundtrips() {
+        let (input, _filtered_plain) = build_valid_framed_container_with_split_deflate();
 
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("zbit_pack_png_preflate_{stamp}.zbpk"));
+        let path = std::env::temp_dir().join(format!("zbit_pack_recursive_{stamp}.zbpk"));
 
         let stats = compress_adaptive_to_file(&input, &path).expect("compress adaptive");
         let output = decompress_file(&path).expect("decompress adaptive");
@@ -2254,8 +2993,8 @@ mod tests {
 
         assert_eq!(output, input);
         assert!(
-            stats.png_preflate_xz_candidate_bytes.is_some(),
-            "png-preflate-xz candidate should be available for valid RGBA8 PNG"
+            stats.recursive_circuit_xz_candidate_bytes.is_some(),
+            "recursive-circuit-xz candidate should be available for valid framed deflate container"
         );
         assert!(stats.compressed_size <= stats.raw_candidate_bytes);
     }

@@ -9,8 +9,8 @@ pub enum PackMethod {
     IndexedHuffman,
     RawDeflate,
     RawZstd,
-    PngIdatRaw,
-    PngPreflateXz,
+    FramedRaw,
+    RecursiveCircuitXz,
 }
 
 impl PackMethod {
@@ -22,8 +22,8 @@ impl PackMethod {
             Self::IndexedHuffman => 3,
             Self::RawDeflate => 4,
             Self::RawZstd => 5,
-            Self::PngIdatRaw => 6,
-            Self::PngPreflateXz => 7,
+            Self::FramedRaw => 6,
+            Self::RecursiveCircuitXz => 7,
         }
     }
 
@@ -35,8 +35,8 @@ impl PackMethod {
             3 => Some(Self::IndexedHuffman),
             4 => Some(Self::RawDeflate),
             5 => Some(Self::RawZstd),
-            6 => Some(Self::PngIdatRaw),
-            7 => Some(Self::PngPreflateXz),
+            6 => Some(Self::FramedRaw),
+            7 => Some(Self::RecursiveCircuitXz),
             _ => None,
         }
     }
@@ -49,8 +49,8 @@ impl PackMethod {
             Self::IndexedHuffman => "indexed-huffman",
             Self::RawDeflate => "raw-deflate",
             Self::RawZstd => "raw-zstd",
-            Self::PngIdatRaw => "png-idat-raw",
-            Self::PngPreflateXz => "png-preflate-xz",
+            Self::FramedRaw => "framed-raw",
+            Self::RecursiveCircuitXz => "recursive-circuit-xz",
         }
     }
 }
@@ -69,8 +69,8 @@ pub struct PackEvaluation {
     pub indexed_huffman_total_bytes: Option<usize>,
     pub raw_deflate_total_bytes: Option<usize>,
     pub raw_zstd_total_bytes: Option<usize>,
-    pub png_idat_raw_total_bytes: Option<usize>,
-    pub png_preflate_xz_total_bytes: Option<usize>,
+    pub framed_raw_total_bytes: Option<usize>,
+    pub recursive_circuit_xz_total_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -89,8 +89,8 @@ impl PackEvaluation {
             indexed_huffman_total_bytes: None,
             raw_deflate_total_bytes: None,
             raw_zstd_total_bytes: None,
-            png_idat_raw_total_bytes: None,
-            png_preflate_xz_total_bytes: None,
+            framed_raw_total_bytes: None,
+            recursive_circuit_xz_total_bytes: None,
             chosen_method: PackMethod::RawCopy,
             chosen_reason: String::new(),
         }
@@ -182,24 +182,24 @@ pub fn choose_best_method(eval: &mut PackEvaluation) {
         }
     }
 
-    if let Some(png_idat_size) = eval.png_idat_raw_total_bytes {
-        if png_idat_size < best_size {
-            best_method = PackMethod::PngIdatRaw;
-            best_size = png_idat_size;
+    if let Some(framed_size) = eval.framed_raw_total_bytes {
+        if framed_size < best_size {
+            best_method = PackMethod::FramedRaw;
+            best_size = framed_size;
             best_reason = format!(
-                "png-idat-raw improves size: {} -> {} bytes",
-                eval.raw_total_bytes, png_idat_size
+                "framed-raw improves size: {} -> {} bytes",
+                eval.raw_total_bytes, framed_size
             );
         }
     }
 
-    if let Some(preflate_size) = eval.png_preflate_xz_total_bytes {
-        if preflate_size < best_size {
-            best_method = PackMethod::PngPreflateXz;
-            best_size = preflate_size;
+    if let Some(recursive_size) = eval.recursive_circuit_xz_total_bytes {
+        if recursive_size < best_size {
+            best_method = PackMethod::RecursiveCircuitXz;
+            best_size = recursive_size;
             best_reason = format!(
-                "png-preflate-xz improves size: {} -> {} bytes",
-                eval.raw_total_bytes, preflate_size
+                "recursive-circuit-xz improves size: {} -> {} bytes",
+                eval.raw_total_bytes, recursive_size
             );
         }
     }
