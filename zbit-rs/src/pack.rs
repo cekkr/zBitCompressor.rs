@@ -7,10 +7,10 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use crc32fast::Hasher as Crc32Hasher;
 use crate::error::{ZbitError, ZbitResult};
 use crate::model::ZbitModel;
 use crate::pack_rules::{choose_best_method, should_evaluate_circuit, PackEvaluation, PackMethod};
+use crc32fast::Hasher as Crc32Hasher;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use preflate_rs::{preflate_whole_deflate_stream, recreate_whole_deflate_stream, PreflateConfig};
 use xz2::read::{XzDecoder, XzEncoder};
@@ -43,6 +43,7 @@ pub struct PackStats {
     pub raw_zstd_candidate_bytes: Option<usize>,
     pub framed_raw_candidate_bytes: Option<usize>,
     pub recursive_circuit_xz_candidate_bytes: Option<usize>,
+    pub monotonic_delta_candidate_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -237,6 +238,43 @@ struct RecursiveCircuitStream {
     zlib_adler32: [u8; 4],
     transform_plan: CircuitTransformPlan,
     topology: Vec<CircuitTopologyNode>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MonotonicDeltaMode {
+    GapVarint,
+    GapDeltaVarint,
+    GapBytes,
+}
+
+impl MonotonicDeltaMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::GapVarint => 0,
+            Self::GapDeltaVarint => 1,
+            Self::GapBytes => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::GapVarint),
+            1 => Some(Self::GapDeltaVarint),
+            2 => Some(Self::GapBytes),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MonotonicDeltaStream {
+    width: u8,
+    count: u64,
+    first_value: u64,
+    transformed_plain_len: usize,
+    mode: MonotonicDeltaMode,
+    codec: PayloadCodec,
+    payload: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -528,7 +566,10 @@ fn build_huffman_stream(input: &[u8], stream: &IndexStream) -> ZbitResult<Option
     }))
 }
 
-fn decode_huffman_dictionary(dict_bytes: &[u8], unique_count: usize) -> ZbitResult<(Vec<u8>, Vec<u8>)> {
+fn decode_huffman_dictionary(
+    dict_bytes: &[u8],
+    unique_count: usize,
+) -> ZbitResult<(Vec<u8>, Vec<u8>)> {
     if dict_bytes.len() != unique_count.saturating_mul(2) {
         return Err(ZbitError::Parse(
             "indexed-huffman dictionary size must be 2 * unique_count".to_string(),
@@ -562,10 +603,14 @@ fn insert_decode_code(root: &mut DecodeNode, code: u64, len: u8, symbol: u8) -> 
         let bit = ((code >> shift) & 1) as u8;
 
         if bit == 0 {
-            let next = cursor.left.get_or_insert_with(|| Box::<DecodeNode>::default());
+            let next = cursor
+                .left
+                .get_or_insert_with(|| Box::<DecodeNode>::default());
             cursor = next.as_mut();
         } else {
-            let next = cursor.right.get_or_insert_with(|| Box::<DecodeNode>::default());
+            let next = cursor
+                .right
+                .get_or_insert_with(|| Box::<DecodeNode>::default());
             cursor = next.as_mut();
         }
     }
@@ -657,7 +702,8 @@ fn decode_raw_deflate_payload(payload: &[u8], original_size: usize) -> ZbitResul
 }
 
 fn build_raw_zstd_payload(input: &[u8]) -> ZbitResult<Vec<u8>> {
-    zstd_stream::encode_all(input, 19).map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
+    zstd_stream::encode_all(input, 19)
+        .map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
 }
 
 fn decode_raw_zstd_payload(payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
@@ -762,6 +808,349 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> ZbitResult<u64> {
     ]))
 }
 
+fn push_varint_u64(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn read_varint_u64(bytes: &[u8], cursor: &mut usize) -> ZbitResult<u64> {
+    let mut shift = 0u32;
+    let mut value = 0u64;
+
+    for _ in 0..10 {
+        let byte = read_u8(bytes, cursor)?;
+        let chunk = (byte & 0x7F) as u64;
+        let shifted = chunk.checked_shl(shift).ok_or_else(|| {
+            ZbitError::Parse("varint shift overflow while decoding u64".to_string())
+        })?;
+        value |= shifted;
+        if (byte & 0x80) == 0 {
+            return Ok(value);
+        }
+        shift = shift.saturating_add(7);
+    }
+
+    Err(ZbitError::Parse(
+        "varint exceeds 10-byte u64 representation".to_string(),
+    ))
+}
+
+fn max_value_for_width(width: usize) -> Option<u64> {
+    if width == 0 || width > 8 {
+        return None;
+    }
+    if width == 8 {
+        return Some(u64::MAX);
+    }
+    Some((1u64 << (width * 8)) - 1)
+}
+
+fn read_le_u64_width(slice: &[u8], width: usize) -> Option<u64> {
+    if width == 0 || width > 8 || slice.len() != width {
+        return None;
+    }
+    let mut value = 0u64;
+    for (shift, &byte) in slice.iter().enumerate() {
+        value |= (byte as u64) << (shift * 8);
+    }
+    Some(value)
+}
+
+fn write_le_u64_width(out: &mut Vec<u8>, value: u64, width: usize) -> ZbitResult<()> {
+    let max = max_value_for_width(width).ok_or_else(|| {
+        ZbitError::Internal("monotonic-delta width must be between 1 and 8".to_string())
+    })?;
+    if value > max {
+        return Err(ZbitError::Parse(format!(
+            "monotonic-delta value {value} does not fit in {width} bytes"
+        )));
+    }
+    for shift in 0..width {
+        out.push(((value >> (shift * 8)) & 0xFF) as u8);
+    }
+    Ok(())
+}
+
+fn encode_zigzag_i64(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+
+fn decode_zigzag_i64(value: u64) -> Option<i64> {
+    if value > ((i64::MAX as u64) << 1) + 1 {
+        return None;
+    }
+    Some(((value >> 1) as i64) ^ (-((value & 1) as i64)))
+}
+
+fn encode_gap_varints(gaps: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(gaps.len());
+    for &gap in gaps {
+        push_varint_u64(&mut out, gap);
+    }
+    out
+}
+
+fn encode_gap_bytes(gaps: &[u64]) -> Option<Vec<u8>> {
+    if gaps.iter().any(|&gap| gap > u8::MAX as u64) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(gaps.len());
+    for &gap in gaps {
+        out.push(gap as u8);
+    }
+    Some(out)
+}
+
+fn encode_gap_delta_varints(gaps: &[u64]) -> Option<Vec<u8>> {
+    if gaps.is_empty() {
+        return Some(Vec::new());
+    }
+    if gaps.iter().any(|&gap| gap > i64::MAX as u64) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(gaps.len());
+    push_varint_u64(&mut out, gaps[0]);
+
+    let mut prev = gaps[0] as i64;
+    for &gap_u64 in gaps.iter().skip(1) {
+        let gap = gap_u64 as i64;
+        let delta = gap - prev;
+        push_varint_u64(&mut out, encode_zigzag_i64(delta));
+        prev = gap;
+    }
+
+    Some(out)
+}
+
+const MONOTONIC_DELTA_DICT_BYTES: usize = 28;
+
+fn monotonic_delta_dictionary_size(_stream: &MonotonicDeltaStream) -> usize {
+    MONOTONIC_DELTA_DICT_BYTES
+}
+
+fn write_monotonic_delta_dictionary(out: &mut Vec<u8>, stream: &MonotonicDeltaStream) {
+    out.push(stream.width);
+    out.push(stream.mode.as_u8());
+    out.push(stream.codec.as_u8());
+    out.push(0);
+    push_u64(out, stream.count);
+    push_u64(out, stream.first_value);
+    push_u64(out, stream.transformed_plain_len as u64);
+}
+
+fn build_monotonic_delta_stream(input: &[u8]) -> ZbitResult<Option<MonotonicDeltaStream>> {
+    let candidate_widths = [3usize, 4, 2, 5, 6, 7, 8, 1];
+    let mut best: Option<(MonotonicDeltaStream, usize)> = None;
+
+    for width in candidate_widths {
+        if input.is_empty() || input.len() < width * 3 || (input.len() % width) != 0 {
+            continue;
+        }
+
+        let count = input.len() / width;
+        if count < 2 {
+            continue;
+        }
+
+        let mut values = Vec::with_capacity(count);
+        let mut valid = true;
+        for chunk in input.chunks_exact(width) {
+            let Some(value) = read_le_u64_width(chunk, width) else {
+                valid = false;
+                break;
+            };
+            values.push(value);
+        }
+        if !valid {
+            continue;
+        }
+
+        let mut gaps = Vec::with_capacity(count.saturating_sub(1));
+        let mut monotonic = true;
+        for idx in 1..values.len() {
+            if values[idx] <= values[idx - 1] {
+                monotonic = false;
+                break;
+            }
+            gaps.push(values[idx] - values[idx - 1]);
+        }
+        if !monotonic {
+            continue;
+        }
+
+        let mut mode_candidates = Vec::new();
+        if let Some(bytes) = encode_gap_bytes(&gaps) {
+            mode_candidates.push((MonotonicDeltaMode::GapBytes, bytes));
+        }
+        mode_candidates.push((MonotonicDeltaMode::GapVarint, encode_gap_varints(&gaps)));
+        if let Some(bytes) = encode_gap_delta_varints(&gaps) {
+            mode_candidates.push((MonotonicDeltaMode::GapDeltaVarint, bytes));
+        }
+
+        for (mode, transformed) in mode_candidates {
+            let (codec, payload) = choose_best_codec(&transformed, true, true)?;
+            let stream = MonotonicDeltaStream {
+                width: width as u8,
+                count: count as u64,
+                first_value: values[0],
+                transformed_plain_len: transformed.len(),
+                mode,
+                codec,
+                payload,
+            };
+            let total_size = monotonic_delta_dictionary_size(&stream) + stream.payload.len();
+            match &best {
+                Some((_, best_size)) if *best_size <= total_size => {}
+                _ => best = Some((stream, total_size)),
+            }
+        }
+    }
+
+    Ok(best.map(|(stream, _)| stream))
+}
+
+fn decode_monotonic_delta_payload(
+    dict_bytes: &[u8],
+    payload: &[u8],
+    original_size: usize,
+) -> ZbitResult<Vec<u8>> {
+    if dict_bytes.len() != MONOTONIC_DELTA_DICT_BYTES {
+        return Err(ZbitError::Parse(format!(
+            "monotonic-delta dictionary size must be {MONOTONIC_DELTA_DICT_BYTES} bytes"
+        )));
+    }
+
+    let mut dict_cursor = 0usize;
+    let width = read_u8(dict_bytes, &mut dict_cursor)? as usize;
+    let mode =
+        MonotonicDeltaMode::from_u8(read_u8(dict_bytes, &mut dict_cursor)?).ok_or_else(|| {
+            ZbitError::Parse("monotonic-delta dictionary has invalid mode".to_string())
+        })?;
+    let codec = PayloadCodec::from_u8(read_u8(dict_bytes, &mut dict_cursor)?).ok_or_else(|| {
+        ZbitError::Parse("monotonic-delta dictionary has invalid codec".to_string())
+    })?;
+    let _reserved = read_u8(dict_bytes, &mut dict_cursor)?;
+    let count = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let first_value = read_u64(dict_bytes, &mut dict_cursor)?;
+    let transformed_plain_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+
+    if dict_cursor != dict_bytes.len() {
+        return Err(ZbitError::Parse(
+            "trailing bytes in monotonic-delta dictionary".to_string(),
+        ));
+    }
+    if width == 0 || width > 8 {
+        return Err(ZbitError::Parse(
+            "monotonic-delta width must be between 1 and 8".to_string(),
+        ));
+    }
+
+    let expected_original = count
+        .checked_mul(width)
+        .ok_or_else(|| ZbitError::Parse("monotonic-delta output length overflow".to_string()))?;
+    if expected_original != original_size {
+        return Err(ZbitError::Parse(format!(
+            "monotonic-delta output length mismatch: expected {original_size} got {expected_original}"
+        )));
+    }
+    if count == 0 {
+        if original_size == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(ZbitError::Parse(
+            "monotonic-delta count is zero for non-empty payload".to_string(),
+        ));
+    }
+
+    let transformed = decode_with_codec(payload, codec, transformed_plain_len)?;
+    let mut transformed_cursor = 0usize;
+    let max_value = max_value_for_width(width).ok_or_else(|| {
+        ZbitError::Parse("monotonic-delta width does not have a valid value range".to_string())
+    })?;
+
+    let mut out = Vec::with_capacity(original_size);
+    write_le_u64_width(&mut out, first_value, width)?;
+    let mut current = first_value;
+
+    let mut prev_gap = 0u64;
+    for idx in 1..count {
+        let gap = match mode {
+            MonotonicDeltaMode::GapBytes => read_u8(&transformed, &mut transformed_cursor)? as u64,
+            MonotonicDeltaMode::GapVarint => {
+                read_varint_u64(&transformed, &mut transformed_cursor)?
+            }
+            MonotonicDeltaMode::GapDeltaVarint => {
+                if idx == 1 {
+                    let first_gap = read_varint_u64(&transformed, &mut transformed_cursor)?;
+                    prev_gap = first_gap;
+                    first_gap
+                } else {
+                    let encoded_delta = read_varint_u64(&transformed, &mut transformed_cursor)?;
+                    let delta = decode_zigzag_i64(encoded_delta).ok_or_else(|| {
+                        ZbitError::Parse(
+                            "monotonic-delta gap-delta zigzag value exceeds i64 range".to_string(),
+                        )
+                    })? as i128;
+                    let next_gap = (prev_gap as i128).checked_add(delta).ok_or_else(|| {
+                        ZbitError::Parse(
+                            "monotonic-delta gap-delta overflow while decoding".to_string(),
+                        )
+                    })?;
+                    if next_gap <= 0 || next_gap > u64::MAX as i128 {
+                        return Err(ZbitError::Parse(
+                            "monotonic-delta decoded non-positive gap".to_string(),
+                        ));
+                    }
+                    let gap = next_gap as u64;
+                    prev_gap = gap;
+                    gap
+                }
+            }
+        };
+
+        if gap == 0 {
+            return Err(ZbitError::Parse(
+                "monotonic-delta gap must be strictly positive".to_string(),
+            ));
+        }
+
+        current = current.checked_add(gap).ok_or_else(|| {
+            ZbitError::Parse("monotonic-delta value overflow while decoding".to_string())
+        })?;
+        if current > max_value {
+            return Err(ZbitError::Parse(
+                "monotonic-delta decoded value exceeds width capacity".to_string(),
+            ));
+        }
+        write_le_u64_width(&mut out, current, width)?;
+    }
+
+    if transformed_cursor != transformed.len() {
+        return Err(ZbitError::Parse(
+            "trailing bytes in monotonic-delta transformed payload".to_string(),
+        ));
+    }
+
+    if out.len() != original_size {
+        return Err(ZbitError::Parse(format!(
+            "monotonic-delta output length mismatch: expected {original_size} got {}",
+            out.len()
+        )));
+    }
+
+    Ok(out)
+}
+
 fn push_u32_be(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
 }
@@ -804,14 +1193,17 @@ fn build_framed_payload_run(input: &[u8]) -> Option<FramedPayloadRun> {
     let mut start = 0usize;
 
     while start + 12 <= input.len() {
-        let Some((first_len_u32, first_tag, first_data_off, first_next)) = parse_crc32_frame_at(input, start) else {
+        let Some((first_len_u32, first_tag, first_data_off, first_next)) =
+            parse_crc32_frame_at(input, start)
+        else {
             start += 1;
             continue;
         };
 
         let mut chunk_lengths = vec![first_len_u32];
         let mut payload = Vec::<u8>::new();
-        payload.extend_from_slice(input.get(first_data_off..first_data_off + first_len_u32 as usize)?);
+        payload
+            .extend_from_slice(input.get(first_data_off..first_data_off + first_len_u32 as usize)?);
 
         let mut cursor = first_next;
         while let Some((len_u32, tag, data_off, next)) = parse_crc32_frame_at(input, cursor) {
@@ -885,7 +1277,11 @@ fn write_framed_dictionary(out: &mut Vec<u8>, stream: &FramedPayloadRun) {
     out.extend_from_slice(&stream.suffix);
 }
 
-fn decode_framed_payload(dict_bytes: &[u8], payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
+fn decode_framed_payload(
+    dict_bytes: &[u8],
+    payload: &[u8],
+    original_size: usize,
+) -> ZbitResult<Vec<u8>> {
     let mut dict_cursor = 0usize;
     let prefix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
     let suffix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
@@ -927,7 +1323,13 @@ fn decode_framed_payload(dict_bytes: &[u8], payload: &[u8], original_size: usize
 
     let expected_payload = full_chunk_count
         .checked_mul(base_chunk_len)
-        .and_then(|v| if tail_present { v.checked_add(tail_chunk_len) } else { Some(v) })
+        .and_then(|v| {
+            if tail_present {
+                v.checked_add(tail_chunk_len)
+            } else {
+                Some(v)
+            }
+        })
         .ok_or_else(|| ZbitError::Parse("framed-raw payload length overflow".to_string()))?;
 
     if payload.len() != expected_payload {
@@ -960,7 +1362,9 @@ fn decode_framed_payload(dict_bytes: &[u8], payload: &[u8], original_size: usize
         };
         let chunk_data = payload
             .get(payload_cursor..payload_cursor + chunk_len)
-            .ok_or_else(|| ZbitError::Parse("framed-raw payload chunk range out of bounds".to_string()))?;
+            .ok_or_else(|| {
+                ZbitError::Parse("framed-raw payload chunk range out of bounds".to_string())
+            })?;
         payload_cursor += chunk_len;
 
         push_u32_be(&mut out, chunk_len as u32);
@@ -1052,7 +1456,12 @@ fn apply_periodic_head_tail(data: &[u8], period: usize, head: usize) -> Option<V
     Some(heads)
 }
 
-fn invert_periodic_head_tail(data: &[u8], original_len: usize, period: usize, head: usize) -> Option<Vec<u8>> {
+fn invert_periodic_head_tail(
+    data: &[u8],
+    original_len: usize,
+    period: usize,
+    head: usize,
+) -> Option<Vec<u8>> {
     if period < 2 || head == 0 || head >= period || data.len() != original_len {
         return None;
     }
@@ -1184,7 +1593,11 @@ fn periodic_head_bytes(original_len: usize, period: usize, head: usize) -> Optio
     Some(total_head)
 }
 
-fn apply_head_tail_tail_gather(data: &[u8], period: usize, tail_gather_period: usize) -> Option<Vec<u8>> {
+fn apply_head_tail_tail_gather(
+    data: &[u8],
+    period: usize,
+    tail_gather_period: usize,
+) -> Option<Vec<u8>> {
     let head_tail = apply_periodic_head_tail(data, period, 1)?;
     let total_head = periodic_head_bytes(data.len(), period, 1)?;
     let head_stream = head_tail.get(..total_head)?;
@@ -1215,7 +1628,11 @@ fn invert_head_tail_tail_gather(
     invert_periodic_head_tail(&merged, original_len, period, 1)
 }
 
-fn apply_head_tail_tail_gather_delta(data: &[u8], period: usize, tail_gather_period: usize) -> Option<Vec<u8>> {
+fn apply_head_tail_tail_gather_delta(
+    data: &[u8],
+    period: usize,
+    tail_gather_period: usize,
+) -> Option<Vec<u8>> {
     let head_tail = apply_periodic_head_tail(data, period, 1)?;
     let total_head = periodic_head_bytes(data.len(), period, 1)?;
     let head_stream = head_tail.get(..total_head)?;
@@ -1241,14 +1658,22 @@ fn invert_head_tail_tail_gather_delta(
     let head_stream = data.get(..total_head)?;
     let tail_delta = data.get(total_head..)?;
     let tail_gathered = invert_unary_delta(tail_delta);
-    let tail = invert_periodic_gather(&tail_gathered, original_len - total_head, tail_gather_period)?;
+    let tail = invert_periodic_gather(
+        &tail_gathered,
+        original_len - total_head,
+        tail_gather_period,
+    )?;
     let mut merged = Vec::with_capacity(original_len);
     merged.extend_from_slice(head_stream);
     merged.extend_from_slice(&tail);
     invert_periodic_head_tail(&merged, original_len, period, 1)
 }
 
-fn apply_head_tail_tail_delta(data: &[u8], period: usize, tail_delta_period: usize) -> Option<Vec<u8>> {
+fn apply_head_tail_tail_delta(
+    data: &[u8],
+    period: usize,
+    tail_delta_period: usize,
+) -> Option<Vec<u8>> {
     let head_tail = apply_periodic_head_tail(data, period, 1)?;
     let total_head = periodic_head_bytes(data.len(), period, 1)?;
     let head_stream = head_tail.get(..total_head)?;
@@ -1386,7 +1811,11 @@ fn apply_transform_plan(data: &[u8], plan: &CircuitTransformPlan) -> Option<Vec<
     }
 }
 
-fn invert_transform_plan(data: &[u8], original_len: usize, plan: &CircuitTransformPlan) -> Option<Vec<u8>> {
+fn invert_transform_plan(
+    data: &[u8],
+    original_len: usize,
+    plan: &CircuitTransformPlan,
+) -> Option<Vec<u8>> {
     match plan.kind {
         CircuitTransformKind::Identity => {
             if data.len() == original_len {
@@ -1443,18 +1872,26 @@ fn invert_transform_plan(data: &[u8], original_len: usize, plan: &CircuitTransfo
             let recovered = invert_unary_xor(data);
             invert_periodic_gather(&recovered, original_len, plan.period as usize)
         }
-        CircuitTransformKind::PeriodicHeadTailTailGather => {
-            invert_head_tail_tail_gather(data, original_len, plan.period as usize, plan.head as usize)
-        }
-        CircuitTransformKind::PeriodicHeadTailTailGatherDelta => invert_head_tail_tail_gather_delta(
+        CircuitTransformKind::PeriodicHeadTailTailGather => invert_head_tail_tail_gather(
             data,
             original_len,
             plan.period as usize,
             plan.head as usize,
         ),
-        CircuitTransformKind::PeriodicHeadTailTailDelta => {
-            invert_head_tail_tail_delta(data, original_len, plan.period as usize, plan.head as usize)
+        CircuitTransformKind::PeriodicHeadTailTailGatherDelta => {
+            invert_head_tail_tail_gather_delta(
+                data,
+                original_len,
+                plan.period as usize,
+                plan.head as usize,
+            )
         }
+        CircuitTransformKind::PeriodicHeadTailTailDelta => invert_head_tail_tail_delta(
+            data,
+            original_len,
+            plan.period as usize,
+            plan.head as usize,
+        ),
         CircuitTransformKind::PeriodicHeadTailTailXor => {
             invert_head_tail_tail_xor(data, original_len, plan.period as usize, plan.head as usize)
         }
@@ -1486,11 +1923,13 @@ fn xz_decode_all(data: &[u8]) -> ZbitResult<Vec<u8>> {
 }
 
 fn zstd_encode_with_level(data: &[u8], level: i32) -> ZbitResult<Vec<u8>> {
-    zstd_stream::encode_all(data, level).map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
+    zstd_stream::encode_all(data, level)
+        .map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
 }
 
 fn zstd_decode_exact(data: &[u8], expected_len: usize) -> ZbitResult<Vec<u8>> {
-    let out = zstd_stream::decode_all(data).map_err(|e| ZbitError::Parse(format!("zstd decode failed: {e}")))?;
+    let out = zstd_stream::decode_all(data)
+        .map_err(|e| ZbitError::Parse(format!("zstd decode failed: {e}")))?;
     if out.len() != expected_len {
         return Err(ZbitError::Parse(format!(
             "zstd output length mismatch: expected {expected_len} got {}",
@@ -1525,10 +1964,18 @@ fn decode_with_codec(data: &[u8], codec: PayloadCodec, expected_len: usize) -> Z
     }
 }
 
-fn choose_best_codec(data: &[u8], allow_raw: bool, allow_xz_extreme: bool) -> ZbitResult<(PayloadCodec, Vec<u8>)> {
+fn choose_best_codec(
+    data: &[u8],
+    allow_raw: bool,
+    allow_xz_extreme: bool,
+) -> ZbitResult<(PayloadCodec, Vec<u8>)> {
     let mut best_codec = PayloadCodec::Raw;
     let mut best_bytes = if allow_raw { data.to_vec() } else { Vec::new() };
-    let mut best_len = if allow_raw { best_bytes.len() } else { usize::MAX };
+    let mut best_len = if allow_raw {
+        best_bytes.len()
+    } else {
+        usize::MAX
+    };
 
     let xz = xz_encode_with_preset(data, 9)?;
     if xz.len() < best_len {
@@ -1819,7 +2266,12 @@ fn build_topology_for_plan(plan: &CircuitTransformPlan) -> ZbitResult<Vec<Circui
 
 fn choose_adaptive_transform_plan(
     data: &[u8],
-) -> ZbitResult<(CircuitTransformPlan, Vec<CircuitTopologyNode>, PayloadCodec, Vec<u8>)> {
+) -> ZbitResult<(
+    CircuitTransformPlan,
+    Vec<CircuitTopologyNode>,
+    PayloadCodec,
+    Vec<u8>,
+)> {
     let mut plans = vec![
         CircuitTransformPlan {
             kind: CircuitTransformKind::Identity,
@@ -2073,7 +2525,13 @@ fn choose_adaptive_transform_plan(
         }
     }
 
-    let mut best: Option<(CircuitTransformPlan, Vec<CircuitTopologyNode>, PayloadCodec, Vec<u8>, usize)> = None;
+    let mut best: Option<(
+        CircuitTransformPlan,
+        Vec<CircuitTopologyNode>,
+        PayloadCodec,
+        Vec<u8>,
+        usize,
+    )> = None;
     let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
     for plan in selected {
         let Some(transformed) = apply_transform_plan(data, &plan) else {
@@ -2137,8 +2595,10 @@ fn choose_correction_transform_plan(
     }
 }
 
-fn build_recursive_circuit_stream(_input: &[u8], base: &FramedPayloadRun) -> ZbitResult<Option<RecursiveCircuitStream>> {
-
+fn build_recursive_circuit_stream(
+    _input: &[u8],
+    base: &FramedPayloadRun,
+) -> ZbitResult<Option<RecursiveCircuitStream>> {
     if base.payload.len() < 6 {
         return Ok(None);
     }
@@ -2257,12 +2717,16 @@ fn decode_recursive_circuit_payload(
 
     let prefix = dict_bytes
         .get(dict_cursor..dict_cursor + prefix_len)
-        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz prefix range out of bounds".to_string()))?;
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz prefix range out of bounds".to_string())
+        })?;
     dict_cursor += prefix_len;
 
     let suffix = dict_bytes
         .get(dict_cursor..dict_cursor + suffix_len)
-        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz suffix range out of bounds".to_string()))?;
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz suffix range out of bounds".to_string())
+        })?;
     dict_cursor += suffix_len;
 
     let zlib_header_slice = dict_bytes
@@ -2284,9 +2748,17 @@ fn decode_recursive_circuit_payload(
     let correction_plain_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
     let correction_encoded_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
     let transformed_codec = PayloadCodec::from_u8(read_u8(dict_bytes, &mut dict_cursor)?)
-        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz dictionary has invalid transformed codec".to_string()))?;
+        .ok_or_else(|| {
+            ZbitError::Parse(
+                "recursive-circuit-xz dictionary has invalid transformed codec".to_string(),
+            )
+        })?;
     let correction_codec = PayloadCodec::from_u8(read_u8(dict_bytes, &mut dict_cursor)?)
-        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz dictionary has invalid correction codec".to_string()))?;
+        .ok_or_else(|| {
+            ZbitError::Parse(
+                "recursive-circuit-xz dictionary has invalid correction codec".to_string(),
+            )
+        })?;
     let transform_kind_u8 = read_u8(dict_bytes, &mut dict_cursor)?;
     let transform_kind = CircuitTransformKind::from_u8(transform_kind_u8).ok_or_else(|| {
         ZbitError::Parse("recursive-circuit-xz dictionary has invalid transform kind".to_string())
@@ -2330,7 +2802,9 @@ fn decode_recursive_circuit_payload(
             TOPOLOGY_HASH_OFFSET
         } else {
             *hash_by_id.get(&parent_id).ok_or_else(|| {
-                ZbitError::Parse("recursive-circuit-xz topology references unknown parent".to_string())
+                ZbitError::Parse(
+                    "recursive-circuit-xz topology references unknown parent".to_string(),
+                )
             })?
         };
         let mut expected_hash = TOPOLOGY_HASH_OFFSET;
@@ -2367,7 +2841,9 @@ fn decode_recursive_circuit_payload(
 
     let expected_payload = transformed_encoded_len
         .checked_add(correction_encoded_len)
-        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz payload length overflow".to_string()))?;
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz payload length overflow".to_string())
+        })?;
     if payload.len() != expected_payload {
         return Err(ZbitError::Parse(format!(
             "recursive-circuit-xz payload length mismatch: expected {expected_payload} got {}",
@@ -2385,15 +2861,18 @@ fn decode_recursive_circuit_payload(
         correction_plain_len,
         &correction_plan,
     )
-    .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz correction stream is invalid".to_string()))?;
+    .ok_or_else(|| {
+        ZbitError::Parse("recursive-circuit-xz correction stream is invalid".to_string())
+    })?;
     let plan = CircuitTransformPlan {
         kind: transform_kind,
         period: transform_period,
         head: transform_head,
     };
-    let filtered_plain = invert_transform_plan(&transformed, plain_len, &plan).ok_or_else(|| {
-        ZbitError::Parse("recursive-circuit-xz transformed stream is invalid".to_string())
-    })?;
+    let filtered_plain =
+        invert_transform_plan(&transformed, plain_len, &plan).ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz transformed stream is invalid".to_string())
+        })?;
 
     let deflate_stream = recreate_whole_deflate_stream(&filtered_plain, &corrections)
         .map_err(|e| ZbitError::Parse(format!("preflate recreate failed: {e}")))?;
@@ -2402,7 +2881,9 @@ fn decode_recursive_circuit_payload(
         2usize
             .checked_add(deflate_stream.len())
             .and_then(|v| v.checked_add(4))
-            .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz framed payload overflow".to_string()))?,
+            .ok_or_else(|| {
+                ZbitError::Parse("recursive-circuit-xz framed payload overflow".to_string())
+            })?,
     );
     framed_payload.extend_from_slice(&zlib_header);
     framed_payload.extend_from_slice(&deflate_stream);
@@ -2420,8 +2901,16 @@ fn decode_recursive_circuit_payload(
 
     let expected_framed_payload = full_chunk_count
         .checked_mul(base_chunk_len)
-        .and_then(|v| if tail_present { v.checked_add(tail_chunk_len) } else { Some(v) })
-        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz framed length overflow".to_string()))?;
+        .and_then(|v| {
+            if tail_present {
+                v.checked_add(tail_chunk_len)
+            } else {
+                Some(v)
+            }
+        })
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz framed length overflow".to_string())
+        })?;
     if framed_payload.len() != expected_framed_payload {
         return Err(ZbitError::Parse(format!(
             "recursive-circuit-xz framed length mismatch: expected {expected_framed_payload} got {}",
@@ -2429,16 +2918,18 @@ fn decode_recursive_circuit_payload(
         )));
     }
 
-    let chunk_overhead = total_chunks
-        .checked_mul(12)
-        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz chunk overhead overflow".to_string()))?;
+    let chunk_overhead = total_chunks.checked_mul(12).ok_or_else(|| {
+        ZbitError::Parse("recursive-circuit-xz chunk overhead overflow".to_string())
+    })?;
     let mut out = Vec::with_capacity(
         prefix
             .len()
             .checked_add(framed_payload.len())
             .and_then(|v| v.checked_add(suffix.len()))
             .and_then(|v| v.checked_add(chunk_overhead))
-            .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz output length overflow".to_string()))?,
+            .ok_or_else(|| {
+                ZbitError::Parse("recursive-circuit-xz output length overflow".to_string())
+            })?,
     );
     out.extend_from_slice(prefix);
 
@@ -2451,7 +2942,9 @@ fn decode_recursive_circuit_payload(
         };
         let chunk_data = framed_payload
             .get(payload_cursor..payload_cursor + chunk_len)
-            .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz frame range out of bounds".to_string()))?;
+            .ok_or_else(|| {
+                ZbitError::Parse("recursive-circuit-xz frame range out of bounds".to_string())
+            })?;
         payload_cursor += chunk_len;
 
         push_u32_be(&mut out, chunk_len as u32);
@@ -2487,6 +2980,7 @@ fn write_pack_bytes(
     raw_zstd_payload: Option<&[u8]>,
     framed_run: Option<&FramedPayloadRun>,
     recursive_stream: Option<&RecursiveCircuitStream>,
+    monotonic_stream: Option<&MonotonicDeltaStream>,
 ) -> ZbitResult<Vec<u8>> {
     if stream.unique_symbols.len() > u16::MAX as usize {
         return Err(ZbitError::Limit(
@@ -2521,7 +3015,9 @@ fn write_pack_bytes(
         }
         PackMethod::RawDeflate => {
             let payload = raw_deflate_payload.ok_or_else(|| {
-                ZbitError::Internal("raw-deflate payload missing for raw-deflate method".to_string())
+                ZbitError::Internal(
+                    "raw-deflate payload missing for raw-deflate method".to_string(),
+                )
             })?;
             (0u8, 0usize, 0usize, payload.len())
         }
@@ -2539,13 +3035,28 @@ fn write_pack_bytes(
         }
         PackMethod::RecursiveCircuitXz => {
             let recursive = recursive_stream.ok_or_else(|| {
-                ZbitError::Internal("recursive stream missing for recursive-circuit-xz method".to_string())
+                ZbitError::Internal(
+                    "recursive stream missing for recursive-circuit-xz method".to_string(),
+                )
             })?;
             (
                 0u8,
                 0usize,
                 recursive_circuit_dictionary_size(recursive),
                 recursive.transformed_encoded_len + recursive.correction_encoded_len,
+            )
+        }
+        PackMethod::MonotonicDelta => {
+            let monotonic = monotonic_stream.ok_or_else(|| {
+                ZbitError::Internal(
+                    "monotonic stream missing for monotonic-delta method".to_string(),
+                )
+            })?;
+            (
+                0u8,
+                0usize,
+                monotonic_delta_dictionary_size(monotonic),
+                monotonic.payload.len(),
             )
         }
     };
@@ -2585,7 +3096,9 @@ fn write_pack_bytes(
         }
         PackMethod::IndexedHuffman => {
             let hs = huffman_stream.ok_or_else(|| {
-                ZbitError::Internal("huffman stream missing for indexed-huffman dictionary".to_string())
+                ZbitError::Internal(
+                    "huffman stream missing for indexed-huffman dictionary".to_string(),
+                )
             })?;
 
             if hs.symbols.len() != hs.code_lengths.len() {
@@ -2608,24 +3121,40 @@ fn write_pack_bytes(
         }
         PackMethod::RecursiveCircuitXz => {
             let recursive = recursive_stream.ok_or_else(|| {
-                ZbitError::Internal("recursive stream missing for recursive-circuit-xz dictionary".to_string())
+                ZbitError::Internal(
+                    "recursive stream missing for recursive-circuit-xz dictionary".to_string(),
+                )
             })?;
             write_recursive_circuit_dictionary(&mut out, recursive);
+        }
+        PackMethod::MonotonicDelta => {
+            let monotonic = monotonic_stream.ok_or_else(|| {
+                ZbitError::Internal(
+                    "monotonic stream missing for monotonic-delta dictionary".to_string(),
+                )
+            })?;
+            write_monotonic_delta_dictionary(&mut out, monotonic);
         }
     }
 
     match method {
         PackMethod::RawCopy => out.extend_from_slice(input),
-        PackMethod::IndexedRaw | PackMethod::IndexedCircuit => out.extend_from_slice(&stream.payload),
+        PackMethod::IndexedRaw | PackMethod::IndexedCircuit => {
+            out.extend_from_slice(&stream.payload)
+        }
         PackMethod::IndexedHuffman => {
             let hs = huffman_stream.ok_or_else(|| {
-                ZbitError::Internal("huffman stream missing for indexed-huffman payload".to_string())
+                ZbitError::Internal(
+                    "huffman stream missing for indexed-huffman payload".to_string(),
+                )
             })?;
             out.extend_from_slice(&hs.payload);
         }
         PackMethod::RawDeflate => {
             let payload = raw_deflate_payload.ok_or_else(|| {
-                ZbitError::Internal("raw-deflate payload missing for raw-deflate method".to_string())
+                ZbitError::Internal(
+                    "raw-deflate payload missing for raw-deflate method".to_string(),
+                )
             })?;
             out.extend_from_slice(&payload);
         }
@@ -2643,10 +3172,20 @@ fn write_pack_bytes(
         }
         PackMethod::RecursiveCircuitXz => {
             let recursive = recursive_stream.ok_or_else(|| {
-                ZbitError::Internal("recursive stream missing for recursive-circuit-xz payload".to_string())
+                ZbitError::Internal(
+                    "recursive stream missing for recursive-circuit-xz payload".to_string(),
+                )
             })?;
             out.extend_from_slice(&recursive.transformed_payload);
             out.extend_from_slice(&recursive.corrections_payload);
+        }
+        PackMethod::MonotonicDelta => {
+            let monotonic = monotonic_stream.ok_or_else(|| {
+                ZbitError::Internal(
+                    "monotonic stream missing for monotonic-delta payload".to_string(),
+                )
+            })?;
+            out.extend_from_slice(&monotonic.payload);
         }
     }
 
@@ -2657,7 +3196,8 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     let stream = build_index_stream(input)?;
 
     let raw_candidate_bytes = ZBPK_HEADER_BYTES + input.len();
-    let indexed_raw_candidate_bytes = ZBPK_HEADER_BYTES + stream.unique_symbols.len() + stream.payload.len();
+    let indexed_raw_candidate_bytes =
+        ZBPK_HEADER_BYTES + stream.unique_symbols.len() + stream.payload.len();
 
     let huffman_stream = build_huffman_stream(input, &stream)?;
     let indexed_huffman_candidate_bytes = huffman_stream
@@ -2675,14 +3215,16 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         Some(run) => build_recursive_circuit_stream(input, run)?,
         None => None,
     };
-    let recursive_circuit_xz_candidate_bytes = recursive_stream
-        .as_ref()
-        .map(|recursive| {
-            ZBPK_HEADER_BYTES
-                + recursive_circuit_dictionary_size(recursive)
-                + recursive.transformed_encoded_len
-                + recursive.correction_encoded_len
-        });
+    let recursive_circuit_xz_candidate_bytes = recursive_stream.as_ref().map(|recursive| {
+        ZBPK_HEADER_BYTES
+            + recursive_circuit_dictionary_size(recursive)
+            + recursive.transformed_encoded_len
+            + recursive.correction_encoded_len
+    });
+    let monotonic_stream = build_monotonic_delta_stream(input)?;
+    let monotonic_delta_candidate_bytes = monotonic_stream.as_ref().map(|stream| {
+        ZBPK_HEADER_BYTES + monotonic_delta_dictionary_size(stream) + stream.payload.len()
+    });
 
     let mut eval = PackEvaluation::new();
     eval.original_size = input.len();
@@ -2696,17 +3238,19 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
     eval.raw_zstd_total_bytes = raw_zstd_candidate_bytes;
     eval.framed_raw_total_bytes = framed_raw_candidate_bytes;
     eval.recursive_circuit_xz_total_bytes = recursive_circuit_xz_candidate_bytes;
+    eval.monotonic_delta_total_bytes = monotonic_delta_candidate_bytes;
 
     let (should_eval_circuit, circuit_rule_note) = should_evaluate_circuit(&eval);
 
-    let (circuit_blobs, circuit_dictionary_bytes, indexed_circuit_candidate_bytes) = if should_eval_circuit {
-        let (blobs, dict_bytes) = build_circuit_blobs(&stream.unique_symbols)?;
-        let candidate = ZBPK_HEADER_BYTES + dict_bytes + stream.payload.len();
-        eval.indexed_circuit_total_bytes = Some(candidate);
-        (Some(blobs), dict_bytes, Some(candidate))
-    } else {
-        (None, 0usize, None)
-    };
+    let (circuit_blobs, circuit_dictionary_bytes, indexed_circuit_candidate_bytes) =
+        if should_eval_circuit {
+            let (blobs, dict_bytes) = build_circuit_blobs(&stream.unique_symbols)?;
+            let candidate = ZBPK_HEADER_BYTES + dict_bytes + stream.payload.len();
+            eval.indexed_circuit_total_bytes = Some(candidate);
+            (Some(blobs), dict_bytes, Some(candidate))
+        } else {
+            (None, 0usize, None)
+        };
 
     choose_best_method(&mut eval);
 
@@ -2721,13 +3265,16 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         Some(raw_zstd_payload.as_slice()),
         framed_run.as_ref(),
         recursive_stream.as_ref(),
+        monotonic_stream.as_ref(),
     )?;
 
     fs::write(path.as_ref(), &pack_bytes)?;
 
     let (bits_per_symbol, payload_bytes, huffman_dictionary_bytes) = match eval.chosen_method {
         PackMethod::RawCopy => (0u8, input.len(), 0usize),
-        PackMethod::IndexedRaw | PackMethod::IndexedCircuit => (stream.bits_per_symbol, stream.payload.len(), 0usize),
+        PackMethod::IndexedRaw | PackMethod::IndexedCircuit => {
+            (stream.bits_per_symbol, stream.payload.len(), 0usize)
+        }
         PackMethod::IndexedHuffman => {
             let hs = huffman_stream.as_ref().ok_or_else(|| {
                 ZbitError::Internal("indexed-huffman selected without huffman stream".to_string())
@@ -2744,13 +3291,21 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         }
         PackMethod::RecursiveCircuitXz => {
             let recursive = recursive_stream.as_ref().ok_or_else(|| {
-                ZbitError::Internal("recursive-circuit-xz selected without recursive stream".to_string())
+                ZbitError::Internal(
+                    "recursive-circuit-xz selected without recursive stream".to_string(),
+                )
             })?;
             (
                 0u8,
                 recursive.transformed_encoded_len + recursive.correction_encoded_len,
                 0usize,
             )
+        }
+        PackMethod::MonotonicDelta => {
+            let monotonic = monotonic_stream.as_ref().ok_or_else(|| {
+                ZbitError::Internal("monotonic-delta selected without monotonic stream".to_string())
+            })?;
+            (0u8, monotonic.payload.len(), 0usize)
         }
     };
 
@@ -2771,6 +3326,7 @@ pub fn compress_adaptive_to_file(input: &[u8], path: impl AsRef<Path>) -> ZbitRe
         raw_zstd_candidate_bytes,
         framed_raw_candidate_bytes,
         recursive_circuit_xz_candidate_bytes,
+        monotonic_delta_candidate_bytes,
         chosen_method: eval.chosen_method,
         chosen_reason: eval.chosen_reason,
         circuit_rule_note,
@@ -2827,7 +3383,9 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
 
     let flags = read_u16(&bytes, &mut cursor)?;
     if flags != 0 {
-        return Err(ZbitError::Parse("non-zero flags are unsupported".to_string()));
+        return Err(ZbitError::Parse(
+            "non-zero flags are unsupported".to_string(),
+        ));
     }
 
     let method = PackMethod::from_u8(read_u8(&bytes, &mut cursor)?)
@@ -2861,7 +3419,11 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
 
     match method {
         PackMethod::RawCopy => {
-            if bits_per_symbol != 0 || unique_count != 0 || dict_size != 0 || payload_size != original_size {
+            if bits_per_symbol != 0
+                || unique_count != 0
+                || dict_size != 0
+                || payload_size != original_size
+            {
                 return Err(ZbitError::Parse(
                     "invalid raw-copy header/dictionary/payload sizing".to_string(),
                 ));
@@ -2878,7 +3440,8 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
         PackMethod::RawDeflate => {
             if bits_per_symbol != 0 || unique_count != 0 || dict_size != 0 {
                 return Err(ZbitError::Parse(
-                    "raw-deflate requires bits_per_symbol=0, unique_count=0, dict_size=0".to_string(),
+                    "raw-deflate requires bits_per_symbol=0, unique_count=0, dict_size=0"
+                        .to_string(),
                 ));
             }
             return decode_raw_deflate_payload(payload, original_size);
@@ -2902,10 +3465,19 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
         PackMethod::RecursiveCircuitXz => {
             if bits_per_symbol != 0 || unique_count != 0 {
                 return Err(ZbitError::Parse(
-                    "recursive-circuit-xz requires bits_per_symbol=0 and unique_count=0".to_string(),
+                    "recursive-circuit-xz requires bits_per_symbol=0 and unique_count=0"
+                        .to_string(),
                 ));
             }
             return decode_recursive_circuit_payload(dict, payload, original_size);
+        }
+        PackMethod::MonotonicDelta => {
+            if bits_per_symbol != 0 || unique_count != 0 {
+                return Err(ZbitError::Parse(
+                    "monotonic-delta requires bits_per_symbol=0 and unique_count=0".to_string(),
+                ));
+            }
+            return decode_monotonic_delta_payload(dict, payload, original_size);
         }
         PackMethod::IndexedHuffman => {
             if bits_per_symbol != 0 {
@@ -2934,7 +3506,8 @@ pub fn decompress_file(path: impl AsRef<Path>) -> ZbitResult<Vec<u8>> {
         | PackMethod::RawDeflate
         | PackMethod::RawZstd
         | PackMethod::FramedRaw
-        | PackMethod::RecursiveCircuitXz => {
+        | PackMethod::RecursiveCircuitXz
+        | PackMethod::MonotonicDelta => {
             unreachable!()
         }
     };
@@ -3152,7 +3725,10 @@ mod tests {
         assert_eq!(output, input);
         assert!(stats.compressed_size <= stats.raw_candidate_bytes);
         assert!(
-            matches!(stats.chosen_method, PackMethod::RawDeflate | PackMethod::RawZstd),
+            matches!(
+                stats.chosen_method,
+                PackMethod::RawDeflate | PackMethod::RawZstd
+            ),
             "expected a strong raw compressor, got {:?}",
             stats.chosen_method
         );
@@ -3160,7 +3736,8 @@ mod tests {
 
     #[test]
     fn adaptive_pack_can_choose_raw_zstd_and_roundtrip() {
-        let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\nbbbbbbbbbbbbbbbbbbbbbbbb\\n".repeat(10_000);
+        let input =
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\nbbbbbbbbbbbbbbbbbbbbbbbb\\n".repeat(10_000);
 
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3175,6 +3752,41 @@ mod tests {
         assert_eq!(output, input);
         assert!(stats.compressed_size <= stats.raw_candidate_bytes);
         assert!(stats.raw_zstd_candidate_bytes.is_some());
+    }
+
+    #[test]
+    fn adaptive_pack_can_choose_monotonic_delta_and_roundtrip() {
+        let mut input = Vec::new();
+        let mut value = 10_000u64;
+        let mut state = 0xC0FF_EE11u32;
+
+        for _ in 0..90_000usize {
+            write_le_u64_width(&mut input, value, 3).expect("write u24 value");
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let gap = ((state >> 27) as u64) + 1;
+            value = value.saturating_add(gap);
+        }
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("zbit_pack_monotonic_{stamp}.zbpk"));
+
+        let stats = compress_adaptive_to_file(&input, &path).expect("compress adaptive");
+        let output = decompress_file(&path).expect("decompress adaptive");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(output, input);
+        assert!(
+            matches!(stats.chosen_method, PackMethod::MonotonicDelta),
+            "expected monotonic-delta to be chosen, got {:?}",
+            stats.chosen_method
+        );
+        assert!(stats.compressed_size <= stats.raw_candidate_bytes);
+        assert!(stats.monotonic_delta_candidate_bytes.is_some());
     }
 
     #[test]
@@ -3211,7 +3823,8 @@ mod tests {
             head: 1,
         };
         let transformed = apply_transform_plan(&filtered_plain, &plan).expect("build transform");
-        let decoded = invert_transform_plan(&transformed, filtered_plain.len(), &plan).expect("decode transform");
+        let decoded = invert_transform_plan(&transformed, filtered_plain.len(), &plan)
+            .expect("decode transform");
         assert_eq!(decoded, filtered_plain);
     }
 

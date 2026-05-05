@@ -11,7 +11,12 @@ fn format_timestamp_local(now: SystemTime) -> String {
     let datetime: chrono_like::DateTimeParts = now.into();
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second
+        datetime.year,
+        datetime.month,
+        datetime.day,
+        datetime.hour,
+        datetime.minute,
+        datetime.second
     )
 }
 
@@ -105,8 +110,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let savings_percent = (1.0 - ratio) * 100.0;
 
     let mib = stats.original_size as f64 / (1024.0 * 1024.0);
-    let compression_mibs = if compression_s > 0.0 { mib / compression_s } else { 0.0 };
-    let decompression_mibs = if decompression_s > 0.0 { mib / decompression_s } else { 0.0 };
+    let compression_mibs = if compression_s > 0.0 {
+        mib / compression_s
+    } else {
+        0.0
+    };
+    let decompression_mibs = if decompression_s > 0.0 {
+        mib / decompression_s
+    } else {
+        0.0
+    };
 
     let now = format_timestamp_local(SystemTime::now());
 
@@ -128,6 +141,7 @@ Raw-deflate candidate size (bytes): {raw_deflate}\n\
 Raw-zstd candidate size (bytes): {raw_zstd}\n\
 Framed-raw candidate size (bytes): {framed_raw}\n\
 Recursive-circuit-xz candidate size (bytes): {recursive_circuit_xz}\n\
+Monotonic-delta candidate size (bytes): {monotonic_delta}\n\
 \n\
 Original size (bytes): {orig}\n\
 Compressed size (bytes): {comp}\n\
@@ -176,6 +190,10 @@ Output validation: {valid}\n",
             .recursive_circuit_xz_candidate_bytes
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unavailable".to_string()),
+        monotonic_delta = stats
+            .monotonic_delta_candidate_bytes
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unavailable".to_string()),
         orig = stats.original_size,
         comp = stats.compressed_size,
         ratio = ratio,
@@ -202,7 +220,10 @@ Output validation: {valid}\n",
     println!("selection reason: {}", stats.chosen_reason);
     println!("original bytes: {}", stats.original_size);
     println!("compressed bytes: {}", stats.compressed_size);
-    println!("output validation: {}", if output_valid { "PASS" } else { "FAIL" });
+    println!(
+        "output validation: {}",
+        if output_valid { "PASS" } else { "FAIL" }
+    );
 
     if !output_valid {
         return Err("decompressed output does not match input".into());

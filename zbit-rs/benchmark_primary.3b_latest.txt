@@ -1,0 +1,37 @@
+zBit-rs Real File Benchmark Report
+Generated: 2026-05-05 23:37:51
+Input file: assets/primary.3b.bin
+Compressed artifact: zbit-rs/benchmark_primary.3b.zbpk
+
+Selected method: monotonic-delta
+Selection reason: monotonic-delta improves size: 3233649 -> 563076 bytes
+Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
+
+Raw candidate size (bytes): 3233649
+Indexed-raw candidate size (bytes): 3233905
+Indexed-circuit candidate size (bytes): skipped by rules
+Indexed-huffman candidate size (bytes): 3230731
+Raw-deflate candidate size (bytes): 2682650
+Raw-zstd candidate size (bytes): 2590875
+Framed-raw candidate size (bytes): unavailable
+Recursive-circuit-xz candidate size (bytes): unavailable
+Monotonic-delta candidate size (bytes): 563076
+
+Original size (bytes): 3233613
+Compressed size (bytes): 563076
+Compression ratio (compressed/original): 0.174132
+Space savings (%): 82.59
+
+Compression time (ms): 15436.806
+Decompression time (ms): 129.398
+Compression throughput (MiB/s): 0.200
+Decompression throughput (MiB/s): 23.832
+
+Unique symbols: 256
+Bits per symbol index: 0
+Raw dictionary bytes: 256
+Circuit dictionary bytes: 0
+Huffman dictionary bytes: 0
+Packed index payload bytes: 563012
+
+Output validation: PASS

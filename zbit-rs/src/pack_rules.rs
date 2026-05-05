@@ -11,6 +11,7 @@ pub enum PackMethod {
     RawZstd,
     FramedRaw,
     RecursiveCircuitXz,
+    MonotonicDelta,
 }
 
 impl PackMethod {
@@ -24,6 +25,7 @@ impl PackMethod {
             Self::RawZstd => 5,
             Self::FramedRaw => 6,
             Self::RecursiveCircuitXz => 7,
+            Self::MonotonicDelta => 8,
         }
     }
 
@@ -37,6 +39,7 @@ impl PackMethod {
             5 => Some(Self::RawZstd),
             6 => Some(Self::FramedRaw),
             7 => Some(Self::RecursiveCircuitXz),
+            8 => Some(Self::MonotonicDelta),
             _ => None,
         }
     }
@@ -51,6 +54,7 @@ impl PackMethod {
             Self::RawZstd => "raw-zstd",
             Self::FramedRaw => "framed-raw",
             Self::RecursiveCircuitXz => "recursive-circuit-xz",
+            Self::MonotonicDelta => "monotonic-delta",
         }
     }
 }
@@ -71,6 +75,7 @@ pub struct PackEvaluation {
     pub raw_zstd_total_bytes: Option<usize>,
     pub framed_raw_total_bytes: Option<usize>,
     pub recursive_circuit_xz_total_bytes: Option<usize>,
+    pub monotonic_delta_total_bytes: Option<usize>,
 
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
@@ -91,6 +96,7 @@ impl PackEvaluation {
             raw_zstd_total_bytes: None,
             framed_raw_total_bytes: None,
             recursive_circuit_xz_total_bytes: None,
+            monotonic_delta_total_bytes: None,
             chosen_method: PackMethod::RawCopy,
             chosen_reason: String::new(),
         }
@@ -99,7 +105,10 @@ impl PackEvaluation {
 
 pub fn should_evaluate_circuit(eval: &PackEvaluation) -> (bool, String) {
     if eval.unique_symbols == 0 {
-        return (false, "empty input: no circuit dictionary needed".to_string());
+        return (
+            false,
+            "empty input: no circuit dictionary needed".to_string(),
+        );
     }
 
     if eval.symbol_bits <= 8 {
@@ -123,13 +132,19 @@ pub fn should_evaluate_circuit(eval: &PackEvaluation) -> (bool, String) {
         );
     }
 
-    (true, "circuit candidate allowed by heuristic rules".to_string())
+    (
+        true,
+        "circuit candidate allowed by heuristic rules".to_string(),
+    )
 }
 
 pub fn choose_best_method(eval: &mut PackEvaluation) {
     let mut best_method = PackMethod::RawCopy;
     let mut best_size = eval.raw_total_bytes;
-    let mut best_reason = format!("raw-copy baseline selected ({} bytes)", eval.raw_total_bytes);
+    let mut best_reason = format!(
+        "raw-copy baseline selected ({} bytes)",
+        eval.raw_total_bytes
+    );
 
     if eval.indexed_raw_total_bytes < best_size {
         best_method = PackMethod::IndexedRaw;
@@ -200,6 +215,17 @@ pub fn choose_best_method(eval: &mut PackEvaluation) {
             best_reason = format!(
                 "recursive-circuit-xz improves size: {} -> {} bytes",
                 eval.raw_total_bytes, recursive_size
+            );
+        }
+    }
+
+    if let Some(monotonic_delta_size) = eval.monotonic_delta_total_bytes {
+        if monotonic_delta_size < best_size {
+            best_method = PackMethod::MonotonicDelta;
+            best_size = monotonic_delta_size;
+            best_reason = format!(
+                "monotonic-delta improves size: {} -> {} bytes",
+                eval.raw_total_bytes, monotonic_delta_size
             );
         }
     }
