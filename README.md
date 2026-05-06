@@ -184,6 +184,14 @@ Run the cat challenge benchmark with auto-download (if missing in `assets/`):
 bash zbit-rs/scripts/benchmark_cat_challenge.sh
 ```
 
+## Latest Benchmark Result Files
+
+Store the latest outputs for the three tracked benchmark tests in these files:
+
+- `zbit-rs/benchmark_latest.txt`: paper benchmark (`papers/zbit-algorithmsResearch.md`)
+- `zbit-rs/benchmark_primary.3b_latest.txt`: primary binary benchmark (`assets/primary.3b.bin`)
+- `zbit-rs/benchmark_cat_challenge_latest.txt`: cat challenge benchmark (`assets/cat_challenge.png`)
+
 ## Programmatic Usage (Library)
 
 ```rust
