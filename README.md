@@ -186,7 +186,15 @@ bash zbit-rs/scripts/benchmark_cat_challenge.sh
 
 ## Latest Benchmark Result Files
 
-Store the latest outputs for the three tracked benchmark tests in these files:
+Current snapshot (reports generated on 2026-05-06):
+
+| Test | Input | Selected method | Original -> Compressed (bytes) | Ratio | Savings | Validation |
+| --- | --- | --- | --- | --- | --- | --- |
+| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `PASS` |
+| Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `PASS` |
+| Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `PASS` |
+
+Latest outputs for the three tracked tests are written to:
 
 - `zbit-rs/benchmark_latest.txt`: paper benchmark (`papers/zbit-algorithmsResearch.md`)
 - `zbit-rs/benchmark_primary.3b_latest.txt`: primary binary benchmark (`assets/primary.3b.bin`)
