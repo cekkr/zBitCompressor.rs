@@ -12,6 +12,7 @@ pub enum PackMethod {
     FramedRaw,
     RecursiveCircuitXz,
     MonotonicDelta,
+    RawXz,
 }
 
 impl PackMethod {
@@ -26,6 +27,7 @@ impl PackMethod {
             Self::FramedRaw => 6,
             Self::RecursiveCircuitXz => 7,
             Self::MonotonicDelta => 8,
+            Self::RawXz => 9,
         }
     }
 
@@ -40,6 +42,7 @@ impl PackMethod {
             6 => Some(Self::FramedRaw),
             7 => Some(Self::RecursiveCircuitXz),
             8 => Some(Self::MonotonicDelta),
+            9 => Some(Self::RawXz),
             _ => None,
         }
     }
@@ -55,6 +58,7 @@ impl PackMethod {
             Self::FramedRaw => "framed-raw",
             Self::RecursiveCircuitXz => "recursive-circuit-xz",
             Self::MonotonicDelta => "monotonic-delta",
+            Self::RawXz => "raw-xz",
         }
     }
 }
@@ -73,6 +77,7 @@ pub struct PackEvaluation {
     pub indexed_huffman_total_bytes: Option<usize>,
     pub raw_deflate_total_bytes: Option<usize>,
     pub raw_zstd_total_bytes: Option<usize>,
+    pub raw_xz_total_bytes: Option<usize>,
     pub framed_raw_total_bytes: Option<usize>,
     pub recursive_circuit_xz_total_bytes: Option<usize>,
     pub monotonic_delta_total_bytes: Option<usize>,
@@ -94,6 +99,7 @@ impl PackEvaluation {
             indexed_huffman_total_bytes: None,
             raw_deflate_total_bytes: None,
             raw_zstd_total_bytes: None,
+            raw_xz_total_bytes: None,
             framed_raw_total_bytes: None,
             recursive_circuit_xz_total_bytes: None,
             monotonic_delta_total_bytes: None,
@@ -193,6 +199,17 @@ pub fn choose_best_method(eval: &mut PackEvaluation) {
             best_reason = format!(
                 "raw-zstd improves size: {} -> {} bytes",
                 eval.raw_total_bytes, zstd_size
+            );
+        }
+    }
+
+    if let Some(xz_size) = eval.raw_xz_total_bytes {
+        if xz_size < best_size {
+            best_method = PackMethod::RawXz;
+            best_size = xz_size;
+            best_reason = format!(
+                "raw-xz improves size: {} -> {} bytes",
+                eval.raw_total_bytes, xz_size
             );
         }
     }

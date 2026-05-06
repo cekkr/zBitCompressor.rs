@@ -1,10 +1,10 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-05-06 01:25:32
+Generated: 2026-05-06 17:20:39
 Input file: papers/zbit-algorithmsResearch.md
 Compressed artifact: zbit-rs/benchmark_algorithmsResearch.zbpk
 
-Selected method: raw-zstd
-Selection reason: raw-zstd improves size: 62051 -> 20972 bytes
+Selected method: raw-xz
+Selection reason: raw-xz improves size: 62051 -> 20632 bytes
 Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
 
 Raw candidate size (bytes): 62051
@@ -13,25 +13,26 @@ Indexed-circuit candidate size (bytes): skipped by rules
 Indexed-huffman candidate size (bytes): 37556
 Raw-deflate candidate size (bytes): 22068
 Raw-zstd candidate size (bytes): 20972
+Raw-xz candidate size (bytes): 20632
 Framed-raw candidate size (bytes): unavailable
 Recursive-circuit-xz candidate size (bytes): unavailable
 Monotonic-delta candidate size (bytes): unavailable
 
 Original size (bytes): 62015
-Compressed size (bytes): 20972
-Compression ratio (compressed/original): 0.338176
-Space savings (%): 66.18
+Compressed size (bytes): 20632
+Compression ratio (compressed/original): 0.332694
+Space savings (%): 66.73
 
-Compression time (ms): 146.664
-Decompression time (ms): 0.604
-Compression throughput (MiB/s): 0.403
-Decompression throughput (MiB/s): 97.923
+Compression time (ms): 349.531
+Decompression time (ms): 1.146
+Compression throughput (MiB/s): 0.169
+Decompression throughput (MiB/s): 51.610
 
 Unique symbols: 114
 Bits per symbol index: 0
 Raw dictionary bytes: 114
 Circuit dictionary bytes: 0
 Huffman dictionary bytes: 0
-Packed index payload bytes: 20936
+Packed index payload bytes: 20596
 
 Output validation: PASS

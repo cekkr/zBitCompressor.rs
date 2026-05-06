@@ -139,6 +139,7 @@ Indexed-circuit candidate size (bytes): {indexed_circuit}\n\
 Indexed-huffman candidate size (bytes): {indexed_huffman}\n\
 Raw-deflate candidate size (bytes): {raw_deflate}\n\
 Raw-zstd candidate size (bytes): {raw_zstd}\n\
+Raw-xz candidate size (bytes): {raw_xz}\n\
 Framed-raw candidate size (bytes): {framed_raw}\n\
 Recursive-circuit-xz candidate size (bytes): {recursive_circuit_xz}\n\
 Monotonic-delta candidate size (bytes): {monotonic_delta}\n\
@@ -180,6 +181,10 @@ Output validation: {valid}\n",
             .unwrap_or_else(|| "unavailable".to_string()),
         raw_zstd = stats
             .raw_zstd_candidate_bytes
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unavailable".to_string()),
+        raw_xz = stats
+            .raw_xz_candidate_bytes
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unavailable".to_string()),
         framed_raw = stats
