@@ -1,5 +1,5 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-05-05 23:37:51
+Generated: 2026-05-06 01:25:51
 Input file: assets/primary.3b.bin
 Compressed artifact: zbit-rs/benchmark_primary.3b.zbpk
 
@@ -22,10 +22,10 @@ Compressed size (bytes): 563076
 Compression ratio (compressed/original): 0.174132
 Space savings (%): 82.59
 
-Compression time (ms): 15436.806
-Decompression time (ms): 129.398
-Compression throughput (MiB/s): 0.200
-Decompression throughput (MiB/s): 23.832
+Compression time (ms): 19672.150
+Decompression time (ms): 135.288
+Compression throughput (MiB/s): 0.157
+Decompression throughput (MiB/s): 22.794
 
 Unique symbols: 256
 Bits per symbol index: 0

@@ -1,10 +1,10 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-04-30 16:19:03
-Input file: /Users/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
-Compressed artifact: /Users/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge.zbpk
+Generated: 2026-05-06 01:36:39
+Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
+Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge.zbpk
 
 Selected method: recursive-circuit-xz
-Selection reason: recursive-circuit-xz improves size: 2969440 -> 2677142 bytes
+Selection reason: recursive-circuit-xz improves size: 2969440 -> 2670726 bytes
 Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
 
 Raw candidate size (bytes): 2969440
@@ -14,23 +14,24 @@ Indexed-huffman candidate size (bytes): 2969952
 Raw-deflate candidate size (bytes): 2969872
 Raw-zstd candidate size (bytes): 2969515
 Framed-raw candidate size (bytes): 2965124
-Recursive-circuit-xz candidate size (bytes): 2677142
+Recursive-circuit-xz candidate size (bytes): 2670726
+Monotonic-delta candidate size (bytes): unavailable
 
 Original size (bytes): 2969404
-Compressed size (bytes): 2677142
-Compression ratio (compressed/original): 0.901576
-Space savings (%): 9.84
+Compressed size (bytes): 2670726
+Compression ratio (compressed/original): 0.899415
+Space savings (%): 10.06
 
-Compression time (ms): 454220.769
-Decompression time (ms): 8461.502
-Compression throughput (MiB/s): 0.006
-Decompression throughput (MiB/s): 0.335
+Compression time (ms): 634727.432
+Decompression time (ms): 9686.858
+Compression throughput (MiB/s): 0.004
+Decompression throughput (MiB/s): 0.292
 
 Unique symbols: 256
 Bits per symbol index: 0
 Raw dictionary bytes: 256
 Circuit dictionary bytes: 0
 Huffman dictionary bytes: 0
-Packed index payload bytes: 2676657
+Packed index payload bytes: 2670241
 
 Output validation: PASS

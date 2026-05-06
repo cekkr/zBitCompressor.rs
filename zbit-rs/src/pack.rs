@@ -13,7 +13,9 @@ use crate::pack_rules::{choose_best_method, should_evaluate_circuit, PackEvaluat
 use crc32fast::Hasher as Crc32Hasher;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use preflate_rs::{preflate_whole_deflate_stream, recreate_whole_deflate_stream, PreflateConfig};
-use xz2::read::{XzDecoder, XzEncoder};
+use xz2::read::XzDecoder;
+use xz2::stream::{Check, Filters, LzmaOptions, MatchFinder, Mode, Stream};
+use xz2::write::XzEncoder as XzWriterEncoder;
 use zstd::stream as zstd_stream;
 
 pub const ZBPK_MAGIC: u32 = 0x5A42_504B; // "ZBPK"
@@ -1904,13 +1906,45 @@ fn invert_transform_plan(
     }
 }
 
-fn xz_encode_with_preset(data: &[u8], preset: u32) -> ZbitResult<Vec<u8>> {
-    let mut encoder = XzEncoder::new(Cursor::new(data), preset);
-    let mut out = Vec::new();
+fn xz_encode_easy_preset(data: &[u8], preset: u32) -> ZbitResult<Vec<u8>> {
+    let mut encoder = XzWriterEncoder::new(Vec::new(), preset);
     encoder
-        .read_to_end(&mut out)
-        .map_err(|e| ZbitError::Io(format!("xz encode failed: {e}")))?;
-    Ok(out)
+        .write_all(data)
+        .map_err(|e| ZbitError::Io(format!("xz easy encode write failed: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| ZbitError::Io(format!("xz easy encode finish failed: {e}")))
+}
+
+fn xz_encode_with_profile(
+    data: &[u8],
+    preset: u32,
+    literal_context_bits: u32,
+) -> ZbitResult<Vec<u8>> {
+    let mut options = LzmaOptions::new_preset(preset)
+        .map_err(|e| ZbitError::Io(format!("xz options preset init failed: {e}")))?;
+    options.dict_size(64 * 1024 * 1024);
+    options.literal_context_bits(literal_context_bits);
+    options.literal_position_bits(0);
+    options.position_bits(2);
+    options.mode(Mode::Normal);
+    options.nice_len(273);
+    options.match_finder(MatchFinder::BinaryTree4);
+    options.depth(0);
+
+    let mut filters = Filters::new();
+    filters.lzma2(&options);
+
+    let stream = Stream::new_stream_encoder(&filters, Check::Crc64)
+        .map_err(|e| ZbitError::Io(format!("xz stream init failed: {e}")))?;
+
+    let mut encoder = XzWriterEncoder::new_stream(Vec::new(), stream);
+    encoder
+        .write_all(data)
+        .map_err(|e| ZbitError::Io(format!("xz encode write failed: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| ZbitError::Io(format!("xz encode finish failed: {e}")))
 }
 
 fn xz_decode_all(data: &[u8]) -> ZbitResult<Vec<u8>> {
@@ -1977,19 +2011,29 @@ fn choose_best_codec(
         usize::MAX
     };
 
-    let xz = xz_encode_with_preset(data, 9)?;
-    if xz.len() < best_len {
-        best_len = xz.len();
-        best_codec = PayloadCodec::Xz;
-        best_bytes = xz;
+    for xz in [
+        xz_encode_easy_preset(data, 9)?,
+        xz_encode_with_profile(data, 9, 3)?,
+        xz_encode_with_profile(data, 9, 4)?,
+    ] {
+        if xz.len() < best_len {
+            best_len = xz.len();
+            best_codec = PayloadCodec::Xz;
+            best_bytes = xz;
+        }
     }
 
     if allow_xz_extreme {
-        let xz_extreme = xz_encode_with_preset(data, (1u32 << 31) | 9)?;
-        if xz_extreme.len() < best_len {
-            best_len = xz_extreme.len();
-            best_codec = PayloadCodec::XzExtreme;
-            best_bytes = xz_extreme;
+        for xz_extreme in [
+            xz_encode_easy_preset(data, (1u32 << 31) | 9)?,
+            xz_encode_with_profile(data, (1u32 << 31) | 9, 3)?,
+            xz_encode_with_profile(data, (1u32 << 31) | 9, 4)?,
+        ] {
+            if xz_extreme.len() < best_len {
+                best_len = xz_extreme.len();
+                best_codec = PayloadCodec::XzExtreme;
+                best_bytes = xz_extreme;
+            }
         }
     }
 
@@ -2560,10 +2604,15 @@ fn choose_adaptive_transform_plan(
         ZbitError::Internal("failed to evaluate adaptive transform plans".to_string())
     })?;
     if let Some(transformed) = apply_transform_plan(data, &plan) {
-        let xz_extreme = xz_encode_with_preset(&transformed, (1u32 << 31) | 9)?;
-        if xz_extreme.len() < encoded.len() {
-            codec = PayloadCodec::XzExtreme;
-            encoded = xz_extreme;
+        for xz_extreme in [
+            xz_encode_easy_preset(&transformed, (1u32 << 31) | 9)?,
+            xz_encode_with_profile(&transformed, (1u32 << 31) | 9, 3)?,
+            xz_encode_with_profile(&transformed, (1u32 << 31) | 9, 4)?,
+        ] {
+            if xz_extreme.len() < encoded.len() {
+                codec = PayloadCodec::XzExtreme;
+                encoded = xz_extreme;
+            }
         }
     }
     Ok((plan, topology, codec, encoded))
@@ -2595,6 +2644,34 @@ fn choose_correction_transform_plan(
     }
 }
 
+fn preflate_chain_candidates() -> Vec<u32> {
+    const DEFAULT: [u32; 3] = [4096, 8192, 16384];
+    let Some(raw) = std::env::var_os("ZBIT_PREFLATE_CHAIN_CANDIDATES") else {
+        return DEFAULT.to_vec();
+    };
+
+    let mut out = Vec::new();
+    for token in raw.to_string_lossy().split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = trimmed.parse::<u32>() {
+            if value >= 256 {
+                out.push(value);
+            }
+        }
+    }
+
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() {
+        DEFAULT.to_vec()
+    } else {
+        out
+    }
+}
+
 fn build_recursive_circuit_stream(
     _input: &[u8],
     base: &FramedPayloadRun,
@@ -2609,62 +2686,128 @@ fn build_recursive_circuit_stream(
     zlib_adler32.copy_from_slice(&base.payload[base.payload.len() - 4..]);
     let deflate_stream = &base.payload[2..base.payload.len() - 4];
 
-    let mut config = PreflateConfig::default();
-    config.verify_compression = true;
-    config.plain_text_limit = ZBPK_MAX_OUTPUT_BYTES;
+    let mut best_stream: Option<(RecursiveCircuitStream, usize)> = None;
+    let mut transformed_template: Option<(
+        CircuitTransformPlan,
+        Vec<CircuitTopologyNode>,
+        PayloadCodec,
+        Vec<u8>,
+        usize,
+    )> = None;
+    let mut plain_len = 0usize;
+    let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
 
-    let (chunk, plain) = match preflate_whole_deflate_stream(deflate_stream, &config) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+    for max_chain_length in preflate_chain_candidates() {
+        let mut config = PreflateConfig::default();
+        config.verify_compression = true;
+        config.plain_text_limit = ZBPK_MAX_OUTPUT_BYTES;
+        config.max_chain_length = max_chain_length;
+
+        let (chunk, plain) = match preflate_whole_deflate_stream(deflate_stream, &config) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if transformed_template.is_none() {
+            let plain_bytes = plain.text();
+            plain_len = plain_bytes.len();
+            let (transform_plan, topology, transformed_codec, transformed_payload) =
+                choose_adaptive_transform_plan(plain_bytes)?;
+            transformed_template = Some((
+                transform_plan,
+                topology,
+                transformed_codec,
+                transformed_payload,
+                plain_len,
+            ));
+        }
+
+        let (transform_plan, base_topology, transformed_codec, transformed_payload, plain_len_ref) =
+            transformed_template.as_ref().ok_or_else(|| {
+                ZbitError::Internal(
+                    "recursive-circuit-xz missing transformed template after preflate".to_string(),
+                )
+            })?;
+
+        let corrections = chunk.corrections;
+        let (correction_plan, correction_codec, corrections_payload) =
+            choose_correction_transform_plan(&corrections)?;
+
+        let mut topology = base_topology.clone();
+        let _ = embed_correction_plan_in_topology(&mut topology, &correction_plan)?;
+
+        let transformed_encoded_len = transformed_payload.len();
+        let correction_plain_len = corrections.len();
+        let correction_encoded_len = corrections_payload.len();
+
+        let stream = RecursiveCircuitStream {
+            base: base.clone(),
+            transformed_payload: transformed_payload.clone(),
+            corrections_payload,
+            plain_len: *plain_len_ref,
+            transformed_encoded_len,
+            correction_plain_len,
+            correction_encoded_len,
+            transformed_codec: *transformed_codec,
+            correction_codec,
+            zlib_header,
+            zlib_adler32,
+            transform_plan: *transform_plan,
+            topology,
+        };
+
+        let candidate_total = ZBPK_HEADER_BYTES
+            + recursive_circuit_dictionary_size(&stream)
+            + stream.transformed_encoded_len
+            + stream.correction_encoded_len;
+
+        if trace_recursive {
+            eprintln!(
+                "zbit-trace recursive chain={} plan={} period={} head={} transformed={}({}) corrections={}({}) corr-plain={} total={}",
+                max_chain_length,
+                stream.transform_plan.kind.name(),
+                stream.transform_plan.period,
+                stream.transform_plan.head,
+                stream.transformed_encoded_len,
+                stream.transformed_codec.name(),
+                stream.correction_encoded_len,
+                stream.correction_codec.name(),
+                stream.correction_plain_len,
+                candidate_total,
+            );
+            eprintln!(
+                "zbit-trace recursive correction-plan={} period={} head={}",
+                correction_plan.kind.name(),
+                correction_plan.period,
+                correction_plan.head
+            );
+        }
+
+        match &best_stream {
+            Some((_, best_total)) if *best_total <= candidate_total => {}
+            _ => best_stream = Some((stream, candidate_total)),
+        }
+    }
+
+    let Some((stream, _)) = best_stream else {
+        return Ok(None);
     };
 
-    let plain_bytes = plain.text();
-    let (transform_plan, mut topology, transformed_codec, transformed_payload) =
-        choose_adaptive_transform_plan(plain_bytes)?;
-    let corrections = chunk.corrections;
-    let (correction_plan, correction_codec, corrections_payload) =
-        choose_correction_transform_plan(&corrections)?;
-    let _ = embed_correction_plan_in_topology(&mut topology, &correction_plan)?;
-    let plain_len = plain_bytes.len();
-    let transformed_encoded_len = transformed_payload.len();
-    let correction_plain_len = corrections.len();
-    let correction_encoded_len = corrections_payload.len();
-
-    if std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some() {
+    if trace_recursive {
         eprintln!(
-            "zbit-trace recursive plan={} period={} head={} transformed={}({}) corrections={}({}) corr-plain={}",
-            transform_plan.kind.name(),
-            transform_plan.period,
-            transform_plan.head,
-            transformed_encoded_len,
-            transformed_codec.name(),
-            correction_encoded_len,
-            correction_codec.name(),
-            correction_plain_len,
-        );
-        eprintln!(
-            "zbit-trace recursive correction-plan={} period={} head={}",
-            correction_plan.kind.name(),
-            correction_plan.period,
-            correction_plan.head
+            "zbit-trace recursive selected chain plan={} period={} head={} transformed={}({}) corrections={}({}) plain={}",
+            stream.transform_plan.kind.name(),
+            stream.transform_plan.period,
+            stream.transform_plan.head,
+            stream.transformed_encoded_len,
+            stream.transformed_codec.name(),
+            stream.correction_encoded_len,
+            stream.correction_codec.name(),
+            plain_len,
         );
     }
 
-    Ok(Some(RecursiveCircuitStream {
-        base: base.clone(),
-        transformed_payload,
-        corrections_payload,
-        plain_len,
-        transformed_encoded_len,
-        correction_plain_len,
-        correction_encoded_len,
-        transformed_codec,
-        correction_codec,
-        zlib_header,
-        zlib_adler32,
-        transform_plan,
-        topology,
-    }))
+    Ok(Some(stream))
 }
 
 fn recursive_circuit_dictionary_size(stream: &RecursiveCircuitStream) -> usize {
