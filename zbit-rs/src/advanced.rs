@@ -568,7 +568,8 @@ fn run_espresso_heuristic(
         }
 
         let next = greedy_cover(&pool, on_set, options.objective)?;
-        let next_score = evaluate_cover_objective(&next, options.objective, options.enable_balancing);
+        let next_score =
+            evaluate_cover_objective(&next, options.objective, options.enable_balancing);
 
         if estimate_better(&next_score, &best) {
             cover = next;
@@ -615,12 +616,7 @@ fn forbid_assignment_clause(minterm: u32, num_inputs: u32) -> Vec<i32> {
     clause
 }
 
-fn sat_term_is_redundant(
-    idx: usize,
-    cover: &[Implicant],
-    num_inputs: u32,
-    dc_set: &[u32],
-) -> bool {
+fn sat_term_is_redundant(idx: usize, cover: &[Implicant], num_inputs: u32, dc_set: &[u32]) -> bool {
     let mut cnf = Cnf::new(num_inputs as usize);
 
     let target = cover[idx];
@@ -712,8 +708,10 @@ fn run_rewrite_flows(
             }
 
             let candidate = greedy_cover(&pool, on_set, options.objective)?;
-            let cand_score = evaluate_cover_objective(&candidate, options.objective, options.enable_balancing);
-            let old_score = evaluate_cover_objective(&cover, options.objective, options.enable_balancing);
+            let cand_score =
+                evaluate_cover_objective(&candidate, options.objective, options.enable_balancing);
+            let old_score =
+                evaluate_cover_objective(&cover, options.objective, options.enable_balancing);
 
             if estimate_better(&cand_score, &old_score) {
                 cover = candidate;
@@ -722,8 +720,12 @@ fn run_rewrite_flows(
         }
     }
 
-    stats.sat_pruned_terms +=
-        sat_prune_redundant_terms(&mut cover, num_inputs, dc_set, options.sat_local_exact_inputs);
+    stats.sat_pruned_terms += sat_prune_redundant_terms(
+        &mut cover,
+        num_inputs,
+        dc_set,
+        options.sat_local_exact_inputs,
+    );
 
     if options.enable_balancing {
         cover.sort_unstable_by_key(|i| std::cmp::Reverse(i.literal_count()));
@@ -761,17 +763,14 @@ pub fn minimize_advanced(
 
     let (heuristic_cover, rounds_run) =
         run_espresso_heuristic(num_inputs, &on, &allowed_set, options)?;
-    let (heuristic_cover, heuristic_stats) = run_rewrite_flows(
-        heuristic_cover,
-        num_inputs,
-        &on,
-        &dc,
-        &allowed_set,
-        options,
-    )?;
+    let (heuristic_cover, heuristic_stats) =
+        run_rewrite_flows(heuristic_cover, num_inputs, &on, &dc, &allowed_set, options)?;
 
-    let heuristic_est =
-        evaluate_cover_objective(&heuristic_cover, options.objective, options.enable_balancing);
+    let heuristic_est = evaluate_cover_objective(
+        &heuristic_cover,
+        options.objective,
+        options.enable_balancing,
+    );
 
     let mut report = AdvancedReport {
         used_exact_seed: false,
@@ -791,14 +790,8 @@ pub fn minimize_advanced(
 
     if num_inputs <= options.exact_seed_max_inputs {
         let (exact_cover, _) = minimize_exact(num_inputs, &on, &dc)?;
-        let (exact_cover, exact_stats) = run_rewrite_flows(
-            exact_cover,
-            num_inputs,
-            &on,
-            &dc,
-            &allowed_set,
-            options,
-        )?;
+        let (exact_cover, exact_stats) =
+            run_rewrite_flows(exact_cover, num_inputs, &on, &dc, &allowed_set, options)?;
 
         let exact_est =
             evaluate_cover_objective(&exact_cover, options.objective, options.enable_balancing);
@@ -878,7 +871,11 @@ mod tests {
 
     #[test]
     fn fpga_objective_reports_lut_metrics() {
-        let cover = vec![imp(0b0001, 0b1111), imp(0b0010, 0b1111), imp(0b0100, 0b1111)];
+        let cover = vec![
+            imp(0b0001, 0b1111),
+            imp(0b0010, 0b1111),
+            imp(0b0100, 0b1111),
+        ];
         let estimate = evaluate_cover_objective(&cover, MappingObjective::FpgaLut4, true);
 
         assert!(estimate.estimated_luts > 0);

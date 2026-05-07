@@ -1,6 +1,6 @@
 # zBitCompressor.rs
 
-Rust implementation of the `zBit` compression/decompression model, with an exact two-level Boolean minimizer for small support functions and an adaptive binary pack format for real-file compression.
+Rust implementation of the `zBit` compression/decompression model, with an exact two-level Boolean minimizer for small support functions, an adaptive binary pack format for real-file compression, and a chunked streaming container for real-time encode/decode workflows.
 
 ## Scope
 
@@ -117,7 +117,21 @@ Code:
 - `zbit-rs/src/pack.rs`
 - `zbit-rs/src/pack_rules.rs`
 
-### 7. Validation and benchmark as first-class workflow
+### 7. Streaming compression with multi-level grouping
+
+Implemented:
+
+- `.zbps` chunk-stream container with key-piece intervals for restartable decode
+- per-chunk/per-group adaptive selection with configurable multi-level grouping depth
+- deterministic block boundaries so receivers can start decode from key pieces without replaying full history
+- optional grouping-history hints in block headers for sharing generalized grouping strategy over time
+
+Code:
+
+- `zbit-rs/src/pack.rs`
+- `zbit-rs/src/bin/benchmark_stream_real_file.rs`
+
+### 8. Validation and benchmark as first-class workflow
 
 Paper guidance: implementation quality requires verification + measurement loops.
 
@@ -150,9 +164,10 @@ Inside `zbit-rs/`:
 - `src/minimizer.rs`: exact minimization engine
 - `src/advanced.rs`: heuristic/rewrite/SAT/objective optimization flow
 - `src/sat.rs`: internal SAT solver used by local exactness pruning
-- `src/pack.rs`: adaptive `.zbpk` compression/decompression
+- `src/pack.rs`: adaptive `.zbpk` + streaming `.zbps` compression/decompression
 - `src/pack_rules.rs`: method-selection rules
 - `src/bin/benchmark_real_file.rs`: real-file benchmark binary
+- `src/bin/benchmark_stream_real_file.rs`: real-file stream benchmark binary
 - `tests/`: integration tests
 
 ## Build and Run
@@ -184,6 +199,22 @@ Run the cat challenge benchmark with auto-download (if missing in `assets/`):
 bash zbit-rs/scripts/benchmark_cat_challenge.sh
 ```
 
+Run the streaming benchmark (chunked/key-piece mode):
+
+```bash
+cargo run --manifest-path zbit-rs/Cargo.toml --bin zbit-benchmark-stream -- \
+  assets/cat_challenge.png \
+  zbit-rs/benchmark_cat_challenge_stream.zbps \
+  zbit-rs/benchmark_cat_challenge_stream_latest.txt \
+  262144 8 2 8
+```
+
+Run the cat challenge streaming benchmark script (auto-download if missing):
+
+```bash
+bash zbit-rs/scripts/benchmark_cat_challenge_stream.sh
+```
+
 ## Latest Benchmark Result Files
 
 Current snapshot (reports generated on 2026-05-06):
@@ -199,11 +230,15 @@ Latest outputs for the three tracked tests are written to:
 - `zbit-rs/benchmark_latest.txt`: paper benchmark (`papers/zbit-algorithmsResearch.md`)
 - `zbit-rs/benchmark_primary.3b_latest.txt`: primary binary benchmark (`assets/primary.3b.bin`)
 - `zbit-rs/benchmark_cat_challenge_latest.txt`: cat challenge benchmark (`assets/cat_challenge.png`)
+- `zbit-rs/benchmark_cat_challenge_stream_latest.txt`: cat challenge stream benchmark (`assets/cat_challenge.png`, 256 KiB chunks)
 
 ## Programmatic Usage (Library)
 
 ```rust
-use zbit_rs::{ZbitModel, compress_adaptive_to_file, decompress_file};
+use zbit_rs::{
+    ZbitModel, StreamPackOptions, compress_adaptive_stream_to_file, compress_adaptive_to_file,
+    decompress_file, decompress_stream_file,
+};
 
 // 2-input XOR truth table
 let outputs = [0u8, 1, 1, 0];
@@ -224,6 +259,11 @@ let input = b"abcabcabc";
 let _stats = compress_adaptive_to_file(input, "example.zbpk")?;
 let output = decompress_file("example.zbpk")?;
 assert_eq!(output, input);
+
+let stream_options = StreamPackOptions::default();
+let _stream_stats = compress_adaptive_stream_to_file(input, "example.zbps", &stream_options)?;
+let stream_output = decompress_stream_file("example.zbps")?;
+assert_eq!(stream_output, input);
 # Ok::<(), zbit_rs::ZbitError>(())
 ```
 
@@ -241,6 +281,14 @@ assert_eq!(output, input);
 - version: `2`
 - 36-byte fixed header + dictionary + payload
 - methods: `raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`, `raw-deflate`, `raw-zstd`
+
+### `.zbps` stream pack
+
+- magic: `ZBPS` (`0x5A42_5053`)
+- version: `1`
+- fixed stream header + independent key-piece blocks
+- each block stores a multi-level piece/group topology and embedded `.zbpk` payloads
+- key-piece interval enables restartable decode from block boundaries
 
 ## References
 

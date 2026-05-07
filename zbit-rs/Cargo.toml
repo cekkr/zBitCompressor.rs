@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "zbit-benchmark"
 path = "src/bin/benchmark_real_file.rs"
 
+[[bin]]
+name = "zbit-benchmark-stream"
+path = "src/bin/benchmark_stream_real_file.rs"
+
 [dependencies]
 flate2 = "1.1"
 zstd = "0.13"

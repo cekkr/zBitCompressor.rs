@@ -106,11 +106,7 @@ fn bitset_full(bits: &[u64], nbits: usize) -> bool {
     let full_words = nbits / 64;
     let rem = nbits % 64;
 
-    if bits
-        .iter()
-        .take(full_words)
-        .any(|&word| word != u64::MAX)
-    {
+    if bits.iter().take(full_words).any(|&word| word != u64::MAX) {
         return false;
     }
 
@@ -139,7 +135,12 @@ fn uncovered_count(covered: &[u64], nbits: usize) -> usize {
     total
 }
 
-fn branch_column(rows: &[Vec<u64>], covered: &[u64], selected: &[bool], on_count: usize) -> Option<usize> {
+fn branch_column(
+    rows: &[Vec<u64>],
+    covered: &[u64],
+    selected: &[bool],
+    on_count: usize,
+) -> Option<usize> {
     let mut best_col = None;
     let mut best_options = usize::MAX;
 
@@ -199,7 +200,9 @@ fn dfs_cover(
     selected_literals: i32,
     best: &mut CoverBest,
 ) {
-    if selected_terms > best.terms || (selected_terms == best.terms && selected_literals >= best.literals) {
+    if selected_terms > best.terms
+        || (selected_terms == best.terms && selected_literals >= best.literals)
+    {
         return;
     }
 
@@ -403,7 +406,11 @@ fn select_minimum_cover(primes: &[Implicant], on_set: &[u32]) -> ZbitResult<Vec<
     Ok(selected_implicants)
 }
 
-pub fn minimize_exact(num_inputs: u32, on_set: &[u32], dc_set: &[u32]) -> ZbitResult<(Vec<Implicant>, u32)> {
+pub fn minimize_exact(
+    num_inputs: u32,
+    on_set: &[u32],
+    dc_set: &[u32],
+) -> ZbitResult<(Vec<Implicant>, u32)> {
     if on_set.is_empty() {
         return Ok((Vec::new(), 0));
     }

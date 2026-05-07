@@ -22,3 +22,4 @@ target
 .DS_Store
 assets/cat_challenge.png
 zbit-rs/*.zbpk
+zbit-rs/*.zbps

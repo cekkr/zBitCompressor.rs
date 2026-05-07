@@ -147,7 +147,12 @@ impl ZbitModel {
         self.intern_node_raw(NodeType::Or, -1, &[])
     }
 
-    fn intern_node_raw(&mut self, node_type: NodeType, value: i32, inputs: &[u32]) -> ZbitResult<u32> {
+    fn intern_node_raw(
+        &mut self,
+        node_type: NodeType,
+        value: i32,
+        inputs: &[u32],
+    ) -> ZbitResult<u32> {
         let key = NodeKey {
             node_type,
             value,
@@ -260,7 +265,10 @@ impl ZbitModel {
             let id_set = reduced.iter().copied().collect::<HashSet<_>>();
             for &arg in &reduced {
                 let node = &self.nodes[arg as usize];
-                if node.node_type == NodeType::Not && node.inputs.len() == 1 && id_set.contains(&node.inputs[0]) {
+                if node.node_type == NodeType::Not
+                    && node.inputs.len() == 1
+                    && id_set.contains(&node.inputs[0])
+                {
                     return if node_type == NodeType::And {
                         self.false_id()
                     } else {
@@ -396,7 +404,11 @@ impl ZbitModel {
         Ok((on_set, dc_set))
     }
 
-    pub fn compress_from_table(&mut self, outputs: &[u8], dont_cares: Option<&[u8]>) -> ZbitResult<()> {
+    pub fn compress_from_table(
+        &mut self,
+        outputs: &[u8],
+        dont_cares: Option<&[u8]>,
+    ) -> ZbitResult<()> {
         let (on_set, dc_set) = self.collect_sets_from_table(outputs, dont_cares, true)?;
 
         let (implicants, literal_count) = minimize_exact(self.num_inputs, &on_set, &dc_set)?;
@@ -603,7 +615,9 @@ impl ZbitModel {
         }
 
         if cursor != bytes.len() {
-            return Err(ZbitError::Parse("trailing bytes in serialized model".to_string()));
+            return Err(ZbitError::Parse(
+                "trailing bytes in serialized model".to_string(),
+            ));
         }
 
         if root_id as usize >= nodes.len() {

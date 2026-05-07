@@ -25,12 +25,8 @@ fn xor_truth_table_roundtrip() {
 
 #[test]
 fn dont_care_truth_table_roundtrip() {
-    let outputs = [
-        0u8, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
-    ];
-    let dont_cares = [
-        1u8, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
+    let outputs = [0u8, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+    let dont_cares = [1u8, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     let mut model = ZbitModel::new(4).expect("new model");
     model

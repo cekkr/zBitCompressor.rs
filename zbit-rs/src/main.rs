@@ -79,13 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         1u8, 1, 0, 1, 1, 1, 0, 0, // ON-set = {0,1,3,4,5}
     ];
 
-    let f4_outputs = [
-        0u8, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
-    ];
+    let f4_outputs = [0u8, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
 
-    let f4_dont_cares = [
-        1u8, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
+    let f4_dont_cares = [1u8, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     validate_case("xor2", 2, &xor_outputs, None, true)?;
     validate_case("f3_exact", 3, &f3_outputs, None, true)?;
