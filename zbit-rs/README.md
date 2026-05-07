@@ -1,5 +1,9 @@
 # zbit-rs
 
+Rust crate for the experimental **bits-to-Karnaugh-map circuits compression** model used by `zBit`.
+
+The crate is not meant to be just another byte-stream codec. It contains the implementation pieces that let zBit reinterpret data as Boolean maps, minimize bounded truth tables into circuits, search structural/recursive representations for real files, and then select the smallest reversible encoding candidate.
+
 Rust migration of the `zBit` compression model with:
 - exact small-support minimization (Quine-McCluskey + exact cover)
 - Espresso-style iterative cover heuristics

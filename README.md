@@ -1,6 +1,54 @@
 # zBitCompressor.rs
 
-Rust implementation of the `zBit` compression/decompression model, with an exact two-level Boolean minimizer for small support functions, an adaptive binary pack format for real-file compression, and a chunked streaming container for real-time encode/decode workflows.
+**zBit is an experimental bits-to-Karnaugh-map circuits compression algorithm.**
+
+Its central peculiarity is that it does not only look at a file as a linear sequence of bytes. It also tries to treat the file as a Boolean landscape: bits, positions, symbols, chunks, frame payloads, corrections, and transformed ranges can become cells in a Karnaugh-like map. When regions of that map can be grouped, simplified, linked, or represented as circuits with less metadata than the original bytes, zBit can store the circuit/structure instead of storing the data literally.
+
+In a classic compressor, the main question is often: **"which previous byte sequence or symbol distribution can describe this sequence cheaply?"** In zBit, the deeper question is: **"which Boolean/circuit structure explains these bits cheaply, and is the explanation smaller than the raw data plus corrections?"**
+
+This makes zBit closer to an adaptive structural compressor than to a single fixed codec. The current Rust implementation combines exact Boolean minimization, heuristic cover refinement, SAT-assisted local pruning, canonical circuit DAGs, adaptive byte packing, recursive transform topology, and chunked stream grouping. The packer is intentionally conservative: circuit modeling is used only when the model, dictionary, references, and residual corrections beat simpler representations.
+
+## The Peculiarity: Compression by Boolean Structure
+
+The conceptual model is:
+
+```text
+file bytes -> bit/position/context map -> Karnaugh-like groups -> simplified circuits -> encoded structure + residual corrections
+```
+
+A Karnaugh map groups adjacent equal Boolean outputs so they can be represented by fewer literals. zBit generalizes that idea beyond the small classroom grid:
+
+- **cells** can be individual bits, byte-symbol rows, chunk ranges, transformed positions, framed payload bytes, correction bytes, or stream pieces;
+- **ON/OFF/DC sets** describe what must evaluate to `1`, what must remain `0`, and what may be ignored or corrected elsewhere;
+- **cubes / implicants** are generalized K-map groups over many dimensions;
+- **circuits** are executable descriptions of these groups and relations;
+- **compression wins** only when the structural explanation is smaller than the literal bytes.
+
+The algorithm is therefore not simply "find repeated bytes". A useful pattern may be a Boolean relation, a reusable circuit slice, a transformed residual, a monotonic integer stream, a framed-data reconstruction plan, a global stream slice, or a conventional entropy/codec candidate if that is actually smaller.
+
+## Why This Is Different from Classic Compression
+
+| Classic compression tendency | zBit structural/circuit tendency |
+| --- | --- |
+| Search repeated substrings, dictionaries, or symbol probabilities. | Search Boolean regions, circuit covers, transform topology, reusable slices, and candidate pack structures. |
+| Treat data mainly as a byte stream. | Treat data as bytes **and** as bit-level maps over positions, contexts, chunks, and reversible transforms. |
+| A match is usually a previous sequence or statistical code. | A match can be a simplified circuit, a cube cover, a frame reconstruction rule, a correction plan, or a stream/global slice. |
+| One dominant codec strategy is applied to the whole input or block. | Many reversible representations compete; the smallest validated candidate is selected. |
+| Good entropy coding can hide local redundancy. | zBit tries to expose deeper logical structure before choosing how to encode it. |
+
+This is why the project should be read as a **bits-to-Karnaugh-map-to-circuits compressor**: the Boolean/circuit view is the distinctive research direction, while the adaptive packer makes the approach usable on real files without forcing circuits where they are not economical.
+
+## Algorithm Narrative
+
+At a high level, zBit works like a structural search engine for reversible explanations of data:
+
+1. **Map the data into candidate spaces.** The same input may be seen as raw bytes, indexed symbols, small truth tables, frame payloads, transformed ranges, stream chunks, or correction streams.
+2. **Find compressible Boolean regions.** For bounded truth-table problems, exact minimization builds implicants like K-map groups. For larger inputs, heuristic and SAT-assisted passes try cheaper local improvements.
+3. **Build or reuse circuit-like descriptions.** Canonical nodes, recursive transform nodes, group nodes, and global slices represent structure that can be serialized and later decoded deterministically.
+4. **Estimate total cost, not elegance.** A beautiful circuit is rejected if its metadata is larger than raw bytes or a conventional codec candidate.
+5. **Validate roundtrip reconstruction.** Every selected representation must decode back to the exact original bytes.
+
+The long-term development direction is a stronger **Circuit Atlas**: a cacheable dictionary of reusable circuits/slices that can link distant and apparently unrelated parts of a file or stream when they share hidden Boolean structure. The current code already contains foundations for that direction through canonical models, adaptive candidates, recursive topology metadata, stream grouping, and global-slice references.
 
 ## Scope
 
@@ -306,7 +354,8 @@ assert_eq!(stream_output, input);
 - magic: `ZBPK` (`0x5A42_504B`)
 - version: `2`
 - 36-byte fixed header + dictionary + payload
-- methods: `raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`, `raw-deflate`, `raw-zstd`
+- adaptive methods include `raw-copy`, `indexed-raw`, `indexed-circuit`, `indexed-huffman`, `raw-deflate`, `raw-zstd`, `raw-xz`, `framed-raw`, `recursive-circuit-xz`, and `monotonic-delta`
+- method selection is cost-based: circuit/structural candidates are accepted only when they beat safer raw or codec-backed candidates
 
 ### `.zbps` stream pack
 
