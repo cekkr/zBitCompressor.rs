@@ -1,5 +1,5 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-05-06 17:18:36
+Generated: 2026-05-07 13:16:41
 Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge.zbpk
 
@@ -23,10 +23,18 @@ Compressed size (bytes): 2670718
 Compression ratio (compressed/original): 0.899412
 Space savings (%): 10.06
 
-Compression time (ms): 671484.231
-Decompression time (ms): 9867.003
-Compression throughput (MiB/s): 0.004
-Decompression throughput (MiB/s): 0.287
+Compression time (ms): 617251.656
+Decompression time (ms): 9464.538
+Compression throughput (MiB/s): 0.005
+Decompression throughput (MiB/s): 0.299
+
+Resource usage (KiB):
+- RSS before compression: 5636
+- RSS after compression: 82688
+- RSS after decompression: 83880
+- Compression RSS delta: 77052
+- Decompression RSS delta: 1192
+- Peak RSS (VmHWM): 220928
 
 Unique symbols: 256
 Bits per symbol index: 0

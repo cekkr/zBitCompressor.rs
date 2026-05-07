@@ -79,6 +79,30 @@ mod chrono_like {
     }
 }
 
+fn read_status_kib(field: &str) -> Option<u64> {
+    let content = fs::read_to_string("/proc/self/status").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            let value = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn format_opt_u64(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_opt_delta(before: Option<u64>, after: Option<u64>) -> String {
+    match (before, after) {
+        (Some(a), Some(b)) => b.saturating_sub(a).to_string(),
+        _ => "n/a".to_string(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_path = env::args()
         .nth(1)
@@ -91,14 +115,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "benchmark_latest.txt".to_string());
 
     let input = fs::read(&input_path)?;
+    let rss_before_compress = read_status_kib("VmRSS:");
 
     let t0 = Instant::now();
     let stats = compress_adaptive_to_file(&input, &pack_path)?;
     let compression_s = t0.elapsed().as_secs_f64();
+    let rss_after_compress = read_status_kib("VmRSS:");
 
     let t1 = Instant::now();
     let output = decompress_file(&pack_path)?;
     let decompression_s = t1.elapsed().as_secs_f64();
+    let rss_after_decompress = read_status_kib("VmRSS:");
+    let peak_rss_hwm_kib = read_status_kib("VmHWM:");
 
     let output_valid = input == output;
 
@@ -154,6 +182,14 @@ Decompression time (ms): {decomp_ms:.3}\n\
 Compression throughput (MiB/s): {comp_mibs:.3}\n\
 Decompression throughput (MiB/s): {decomp_mibs:.3}\n\
 \n\
+Resource usage (KiB):\n\
+- RSS before compression: {rss_before}\n\
+- RSS after compression: {rss_after_comp}\n\
+- RSS after decompression: {rss_after_decomp}\n\
+- Compression RSS delta: {rss_delta_comp}\n\
+- Decompression RSS delta: {rss_delta_decomp}\n\
+- Peak RSS (VmHWM): {rss_hwm}\n\
+\n\
 Unique symbols: {unique}\n\
 Bits per symbol index: {bits}\n\
 Raw dictionary bytes: {raw_dict}\n\
@@ -207,6 +243,12 @@ Output validation: {valid}\n",
         decomp_ms = decompression_s * 1000.0,
         comp_mibs = compression_mibs,
         decomp_mibs = decompression_mibs,
+        rss_before = format_opt_u64(rss_before_compress),
+        rss_after_comp = format_opt_u64(rss_after_compress),
+        rss_after_decomp = format_opt_u64(rss_after_decompress),
+        rss_delta_comp = format_opt_delta(rss_before_compress, rss_after_compress),
+        rss_delta_decomp = format_opt_delta(rss_after_compress, rss_after_decompress),
+        rss_hwm = format_opt_u64(peak_rss_hwm_kib),
         unique = stats.unique_symbols,
         bits = stats.bits_per_symbol,
         raw_dict = stats.raw_dictionary_bytes,

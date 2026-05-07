@@ -90,6 +90,42 @@ fn parse_arg_u8(args: &[String], idx: usize, default_value: u8) -> u8 {
         .unwrap_or(default_value)
 }
 
+fn parse_arg_bool(args: &[String], idx: usize, default_value: bool) -> bool {
+    let Some(value) = args.get(idx) else {
+        return default_value;
+    };
+
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default_value,
+    }
+}
+
+fn read_status_kib(field: &str) -> Option<u64> {
+    let content = fs::read_to_string("/proc/self/status").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            let value = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn format_opt_u64(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_opt_delta(before: Option<u64>, after: Option<u64>) -> String {
+    match (before, after) {
+        (Some(a), Some(b)) => b.saturating_sub(a).to_string(),
+        _ => "n/a".to_string(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
@@ -110,26 +146,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_piece_interval = parse_arg_usize(&args, 5, 8);
     let max_group_depth = parse_arg_u8(&args, 6, 2);
     let max_group_pieces = parse_arg_usize(&args, 7, 8);
+    let realtime_mode = parse_arg_bool(&args, 8, true);
+    let wide_overfitting_circuits = parse_arg_bool(&args, 9, true);
+    let carry_grouping_history = parse_arg_bool(&args, 10, true);
 
     let options = StreamPackOptions {
         chunk_size,
         key_piece_interval,
         max_group_depth,
         max_group_pieces,
-        carry_grouping_history: true,
-        realtime_mode: true,
-        wide_overfitting_circuits: true,
+        carry_grouping_history,
+        realtime_mode,
+        wide_overfitting_circuits,
     };
 
     let input = fs::read(&input_path)?;
+    let rss_before_compress = read_status_kib("VmRSS:");
 
     let t0 = Instant::now();
     let stats = compress_adaptive_stream_to_file(&input, &pack_path, &options)?;
     let compression_s = t0.elapsed().as_secs_f64();
+    let rss_after_compress = read_status_kib("VmRSS:");
 
     let t1 = Instant::now();
     let output = decompress_stream_file(&pack_path)?;
     let decompression_s = t1.elapsed().as_secs_f64();
+    let rss_after_decompress = read_status_kib("VmRSS:");
+    let peak_rss_hwm_kib = read_status_kib("VmHWM:");
 
     let output_valid = input == output;
 
@@ -179,9 +222,9 @@ Streaming settings:\n\
 - key piece interval (chunks): {key_interval}\n\
 - max group depth: {max_depth}\n\
 - max group pieces: {max_group_pieces}\n\
-- carry grouping history: true\n\
-- realtime mode: true\n\
-- wide overfitting circuits: true\n\
+- carry grouping history: {carry_grouping_history}\n\
+- realtime mode: {realtime_mode}\n\
+- wide overfitting circuits: {wide_overfitting_circuits}\n\
 \n\
 Stream topology:\n\
 - total chunks: {total_chunks}\n\
@@ -204,12 +247,23 @@ Decompression time (ms): {decomp_ms:.3}\n\
 Compression throughput (MiB/s): {comp_mibs:.3}\n\
 Decompression throughput (MiB/s): {decomp_mibs:.3}\n\
 \n\
+Resource usage (KiB):\n\
+- RSS before compression: {rss_before}\n\
+- RSS after compression: {rss_after_comp}\n\
+- RSS after decompression: {rss_after_decomp}\n\
+- Compression RSS delta: {rss_delta_comp}\n\
+- Decompression RSS delta: {rss_delta_decomp}\n\
+- Peak RSS (VmHWM): {rss_hwm}\n\
+\n\
 Output validation: {output_valid}\n\
 Key-piece resume validation: {key_resume}\n",
         chunk_size = stats.chunk_size,
         key_interval = stats.key_piece_interval,
         max_depth = stats.max_group_depth,
         max_group_pieces = stats.max_group_pieces,
+        carry_grouping_history = options.carry_grouping_history,
+        realtime_mode = options.realtime_mode,
+        wide_overfitting_circuits = options.wide_overfitting_circuits,
         total_chunks = stats.total_chunks,
         key_pieces = stats.key_piece_count,
         block_count = stats.block_count,
@@ -227,6 +281,12 @@ Key-piece resume validation: {key_resume}\n",
         decomp_ms = decompression_s * 1000.0,
         comp_mibs = compression_mibs,
         decomp_mibs = decompression_mibs,
+        rss_before = format_opt_u64(rss_before_compress),
+        rss_after_comp = format_opt_u64(rss_after_compress),
+        rss_after_decomp = format_opt_u64(rss_after_decompress),
+        rss_delta_comp = format_opt_delta(rss_before_compress, rss_after_compress),
+        rss_delta_decomp = format_opt_delta(rss_after_compress, rss_after_decompress),
+        rss_hwm = format_opt_u64(peak_rss_hwm_kib),
         output_valid = if output_valid { "PASS" } else { "FAIL" },
         key_resume = if key_resume_validation {
             "PASS"
@@ -241,8 +301,14 @@ Key-piece resume validation: {key_resume}\n",
     println!("compressed artifact: {pack_path}");
     println!("report file: {report_path}");
     println!(
-        "stream settings: chunk={} bytes key_interval={} max_depth={} max_group_pieces={}",
-        stats.chunk_size, stats.key_piece_interval, stats.max_group_depth, stats.max_group_pieces
+        "stream settings: chunk={} bytes key_interval={} max_depth={} max_group_pieces={} realtime={} wide_overfit={} carry_history={}",
+        stats.chunk_size,
+        stats.key_piece_interval,
+        stats.max_group_depth,
+        stats.max_group_pieces,
+        options.realtime_mode,
+        options.wide_overfitting_circuits,
+        options.carry_grouping_history
     );
     println!("original bytes: {}", stats.original_size);
     println!("compressed bytes: {}", stats.compressed_size);

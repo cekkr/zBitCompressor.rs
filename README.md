@@ -209,28 +209,50 @@ cargo run --manifest-path zbit-rs/Cargo.toml --bin zbit-benchmark-stream -- \
   262144 8 2 8
 ```
 
+Optional trailing flags: `realtime_mode`, `wide_overfitting_circuits`, `carry_grouping_history`
+as boolean values (`true`/`false` or `1`/`0`).
+
 Run the cat challenge streaming benchmark script (auto-download if missing):
 
 ```bash
 bash zbit-rs/scripts/benchmark_cat_challenge_stream.sh
 ```
 
+Run the cat challenge multilevel streaming benchmark matrix (multiple profiles):
+
+```bash
+bash zbit-rs/scripts/benchmark_cat_challenge_stream_multilevel.sh
+```
+
 ## Latest Benchmark Result Files
 
-Current snapshot (reports generated on 2026-05-06):
+Current snapshot (reports generated on 2026-05-07):
 
-| Test | Input | Selected method | Original -> Compressed (bytes) | Ratio | Savings | Validation |
-| --- | --- | --- | --- | --- | --- | --- |
-| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `PASS` |
-| Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `PASS` |
-| Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `PASS` |
+### Latest Single-Run Benchmarks
 
-Latest outputs for the three tracked tests are written to:
+| Test | Input | Selected method/profile | Original -> Compressed (bytes) | Ratio | Savings | Compression ms | Decompression ms | Peak RSS KiB | Validation |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `328.969` | `1.102` | `87332` | `PASS` |
+| Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `28383.045` | `148.948` | `126184` | `PASS` |
+| Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `617251.656` | `9464.538` | `220928` | `PASS` |
+| Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `618791.973` | `9570.839` | `227120` | `PASS` |
+
+### Latest Cat Stream Multilevel Profiles
+
+| Profile | Ratio | Savings | Original -> Compressed (bytes) | Compression ms | Decompression ms | Compression MiB/s | Decompression MiB/s | Compression RSS delta KiB | Decompression RSS delta KiB | Peak RSS KiB | Validation | Resume |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `realtime-fast` | `0.999011` | `0.10%` | `2969404 -> 2966468` | `5967.794` | `10.306` | `0.475` | `274.788` | `5304` | `5016` | `97464` | `PASS` | `PASS` |
+| `realtime-balanced` | `0.998624` | `0.14%` | `2969404 -> 2965318` | `6425.017` | `8.475` | `0.441` | `334.128` | `46188` | `0` | `150832` | `PASS` | `PASS` |
+| `realtime-deep` | `0.998624` | `0.14%` | `2969404 -> 2965318` | `8565.166` | `8.233` | `0.331` | `343.970` | `48568` | `0` | `174632` | `PASS` | `PASS` |
+| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `615185.297` | `9538.138` | `0.005` | `0.297` | `74784` | `12` | `226100` | `PASS` | `PASS` |
+
+Latest outputs for the tracked tests are written to:
 
 - `zbit-rs/benchmark_latest.txt`: paper benchmark (`papers/zbit-algorithmsResearch.md`)
 - `zbit-rs/benchmark_primary.3b_latest.txt`: primary binary benchmark (`assets/primary.3b.bin`)
 - `zbit-rs/benchmark_cat_challenge_latest.txt`: cat challenge benchmark (`assets/cat_challenge.png`)
 - `zbit-rs/benchmark_cat_challenge_stream_latest.txt`: cat challenge stream benchmark (`assets/cat_challenge.png`, 256 KiB chunks)
+- `zbit-rs/benchmark_cat_challenge_stream_multilevel_latest.txt`: cat challenge multilevel stream profile matrix
 
 ## Programmatic Usage (Library)
 

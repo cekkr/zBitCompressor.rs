@@ -13,6 +13,9 @@ chunk_size=262144
 key_piece_interval=8
 max_group_depth=2
 max_group_pieces=8
+realtime_mode=true
+wide_overfitting_circuits=true
+carry_grouping_history=true
 
 mkdir -p "$asset_dir"
 
@@ -58,7 +61,10 @@ cargo run --manifest-path "$repo_root/zbit-rs/Cargo.toml" --bin zbit-benchmark-s
   "$chunk_size" \
   "$key_piece_interval" \
   "$max_group_depth" \
-  "$max_group_pieces"
+  "$max_group_pieces" \
+  "$realtime_mode" \
+  "$wide_overfitting_circuits" \
+  "$carry_grouping_history"
 
 rm -f "$pack_path"
 
