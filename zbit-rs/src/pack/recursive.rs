@@ -1,0 +1,750 @@
+// Licensed under the PolyForm Noncommercial License 1.0.0. See LICENSE.
+// Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
+
+fn push_u32_be(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_u32_be_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn parse_crc32_frame_at(input: &[u8], start: usize) -> Option<(u32, [u8; 4], usize, usize)> {
+    let frame_len_u32 = read_u32_be_at(input, start)?;
+    let frame_len = frame_len_u32 as usize;
+    let tag_off = start.checked_add(4)?;
+    let tag_slice = input.get(tag_off..tag_off + 4)?;
+    let tag = [tag_slice[0], tag_slice[1], tag_slice[2], tag_slice[3]];
+    let data_off = tag_off + 4;
+    let data_end = data_off.checked_add(frame_len)?;
+    let crc_off = data_end;
+    let next = crc_off.checked_add(4)?;
+    if next > input.len() {
+        return None;
+    }
+    let data = input.get(data_off..data_end)?;
+    let crc = read_u32_be_at(input, crc_off)?;
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&tag);
+    hasher.update(data);
+    if hasher.finalize() != crc {
+        return None;
+    }
+    Some((frame_len_u32, tag, data_off, next))
+}
+
+fn build_framed_payload_run(input: &[u8]) -> Option<FramedPayloadRun> {
+    if input.len() < 24 {
+        return None;
+    }
+
+    let mut best: Option<(usize, FramedPayloadRun)> = None;
+    let mut start = 0usize;
+
+    while start + 12 <= input.len() {
+        let Some((first_len_u32, first_tag, first_data_off, first_next)) =
+            parse_crc32_frame_at(input, start)
+        else {
+            start += 1;
+            continue;
+        };
+
+        let mut chunk_lengths = vec![first_len_u32];
+        let mut payload = Vec::<u8>::new();
+        payload
+            .extend_from_slice(input.get(first_data_off..first_data_off + first_len_u32 as usize)?);
+
+        let mut cursor = first_next;
+        while let Some((len_u32, tag, data_off, next)) = parse_crc32_frame_at(input, cursor) {
+            if tag != first_tag {
+                break;
+            }
+            chunk_lengths.push(len_u32);
+            payload.extend_from_slice(input.get(data_off..data_off + len_u32 as usize)?);
+            cursor = next;
+        }
+
+        if chunk_lengths.len() < 2 {
+            start += 1;
+            continue;
+        }
+
+        let total_chunks = u32::try_from(chunk_lengths.len()).ok()?;
+        let base_chunk_len = chunk_lengths[0];
+        let mut full_chunk_count = total_chunks;
+        let mut tail_chunk_len = 0u32;
+
+        if chunk_lengths.iter().any(|&len| len != base_chunk_len) {
+            if chunk_lengths
+                .iter()
+                .take(chunk_lengths.len().saturating_sub(1))
+                .any(|&len| len != base_chunk_len)
+            {
+                start += 1;
+                continue;
+            }
+            full_chunk_count = total_chunks.saturating_sub(1);
+            tail_chunk_len = *chunk_lengths.last().unwrap_or(&0u32);
+        }
+
+        let run = FramedPayloadRun {
+            prefix: input[..start].to_vec(),
+            suffix: input[cursor..].to_vec(),
+            frame_tag: first_tag,
+            payload,
+            base_chunk_len,
+            full_chunk_count,
+            tail_chunk_len,
+            total_chunks,
+        };
+
+        let candidate_size = ZBPK_HEADER_BYTES + framed_dictionary_size(&run) + run.payload.len();
+        match &best {
+            Some((best_size, _)) if *best_size <= candidate_size => {}
+            _ => best = Some((candidate_size, run)),
+        }
+
+        start += 1;
+    }
+
+    best.map(|(_, run)| run)
+}
+
+fn framed_dictionary_size(stream: &FramedPayloadRun) -> usize {
+    28usize + stream.prefix.len() + stream.suffix.len()
+}
+
+fn write_framed_dictionary(out: &mut Vec<u8>, stream: &FramedPayloadRun) {
+    push_u32(out, stream.prefix.len() as u32);
+    push_u32(out, stream.suffix.len() as u32);
+    out.extend_from_slice(&stream.frame_tag);
+    push_u32(out, stream.base_chunk_len);
+    push_u32(out, stream.full_chunk_count);
+    push_u32(out, stream.tail_chunk_len);
+    push_u32(out, stream.total_chunks);
+    out.extend_from_slice(&stream.prefix);
+    out.extend_from_slice(&stream.suffix);
+}
+
+fn decode_framed_payload(
+    dict_bytes: &[u8],
+    payload: &[u8],
+    original_size: usize,
+) -> ZbitResult<Vec<u8>> {
+    let mut dict_cursor = 0usize;
+    let prefix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let suffix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tag_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 4)
+        .ok_or_else(|| ZbitError::Parse("framed-raw missing frame tag".to_string()))?;
+    dict_cursor += 4;
+    let frame_tag = [tag_slice[0], tag_slice[1], tag_slice[2], tag_slice[3]];
+    let base_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let full_chunk_count = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tail_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let total_chunks = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+
+    let prefix = dict_bytes
+        .get(dict_cursor..dict_cursor + prefix_len)
+        .ok_or_else(|| ZbitError::Parse("framed-raw prefix range out of bounds".to_string()))?;
+    dict_cursor += prefix_len;
+
+    let suffix = dict_bytes
+        .get(dict_cursor..dict_cursor + suffix_len)
+        .ok_or_else(|| ZbitError::Parse("framed-raw suffix range out of bounds".to_string()))?;
+    dict_cursor += suffix_len;
+
+    if dict_cursor != dict_bytes.len() {
+        return Err(ZbitError::Parse(
+            "trailing bytes in framed-raw dictionary".to_string(),
+        ));
+    }
+
+    let tail_present = if total_chunks == full_chunk_count {
+        false
+    } else if total_chunks == full_chunk_count + 1 {
+        true
+    } else {
+        return Err(ZbitError::Parse(
+            "framed-raw dictionary has inconsistent chunk counters".to_string(),
+        ));
+    };
+
+    let expected_payload = full_chunk_count
+        .checked_mul(base_chunk_len)
+        .and_then(|v| {
+            if tail_present {
+                v.checked_add(tail_chunk_len)
+            } else {
+                Some(v)
+            }
+        })
+        .ok_or_else(|| ZbitError::Parse("framed-raw payload length overflow".to_string()))?;
+
+    if payload.len() != expected_payload {
+        return Err(ZbitError::Parse(format!(
+            "framed-raw payload length mismatch: expected {expected_payload} got {}",
+            payload.len()
+        )));
+    }
+
+    let chunk_overhead = total_chunks
+        .checked_mul(12)
+        .ok_or_else(|| ZbitError::Parse("framed-raw chunk overhead overflow".to_string()))?;
+    let mut out = Vec::with_capacity(
+        prefix
+            .len()
+            .checked_add(payload.len())
+            .and_then(|v| v.checked_add(suffix.len()))
+            .and_then(|v| v.checked_add(chunk_overhead))
+            .ok_or_else(|| ZbitError::Parse("framed-raw output length overflow".to_string()))?,
+    );
+
+    out.extend_from_slice(prefix);
+
+    let mut payload_cursor = 0usize;
+    for idx in 0..total_chunks {
+        let chunk_len = if idx < full_chunk_count {
+            base_chunk_len
+        } else {
+            tail_chunk_len
+        };
+        let chunk_data = payload
+            .get(payload_cursor..payload_cursor + chunk_len)
+            .ok_or_else(|| {
+                ZbitError::Parse("framed-raw payload chunk range out of bounds".to_string())
+            })?;
+        payload_cursor += chunk_len;
+
+        push_u32_be(&mut out, chunk_len as u32);
+        out.extend_from_slice(&frame_tag);
+        out.extend_from_slice(chunk_data);
+
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&frame_tag);
+        hasher.update(chunk_data);
+        push_u32_be(&mut out, hasher.finalize());
+    }
+
+    out.extend_from_slice(suffix);
+
+    if out.len() != original_size {
+        return Err(ZbitError::Parse(format!(
+            "framed-raw output length mismatch: expected {original_size} got {}",
+            out.len()
+        )));
+    }
+
+    Ok(out)
+}
+
+
+fn preflate_chain_candidates(profile: CompressionProfile) -> Vec<u32> {
+    let default = match profile {
+        CompressionProfile::Fast => vec![4096u32],
+        CompressionProfile::Balanced => vec![4096u32, 8192, 16384],
+        CompressionProfile::Deep => vec![4096u32, 8192, 16384, 24576],
+        CompressionProfile::Research => vec![2048u32, 4096, 8192, 16384, 24576, 32768],
+    };
+    let Some(raw) = std::env::var_os("ZBIT_PREFLATE_CHAIN_CANDIDATES") else {
+        return default;
+    };
+
+    let mut out = Vec::new();
+    for token in raw.to_string_lossy().split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = trimmed.parse::<u32>() {
+            if value >= 256 {
+                out.push(value);
+            }
+        }
+    }
+
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() {
+        default
+    } else {
+        out
+    }
+}
+
+fn build_recursive_circuit_stream(
+    _input: &[u8],
+    base: &FramedPayloadRun,
+    context: &mut CompressionContext,
+) -> ZbitResult<Option<RecursiveCircuitStream>> {
+    if base.payload.len() < 6 {
+        context.push_skipped("recursive-circuit-xz skipped: framed payload smaller than 6 bytes");
+        return Ok(None);
+    }
+    let recursive_total_timer = Instant::now();
+
+    let mut zlib_header = [0u8; 2];
+    zlib_header.copy_from_slice(&base.payload[..2]);
+    let mut zlib_adler32 = [0u8; 4];
+    zlib_adler32.copy_from_slice(&base.payload[base.payload.len() - 4..]);
+    let deflate_stream = &base.payload[2..base.payload.len() - 4];
+    let deflate_stream_hash = payload_hash(deflate_stream);
+
+    let preflate_timer = Instant::now();
+    let mut preflate_results = Vec::new();
+    let mut missing_chain_lengths = Vec::new();
+    for max_chain_length in preflate_chain_candidates(context.profile) {
+        let cache_key = (deflate_stream_hash, max_chain_length);
+        if let Some(cached) = context.cache.preflate_outputs.get(&cache_key) {
+            context.cache_stats.preflate_hits = context.cache_stats.preflate_hits.saturating_add(1);
+            if let Some((corrections, plain)) = cached {
+                preflate_results.push((max_chain_length, corrections.clone(), plain.clone()));
+            }
+            continue;
+        }
+
+        context.cache_stats.preflate_misses = context.cache_stats.preflate_misses.saturating_add(1);
+        missing_chain_lengths.push(max_chain_length);
+    }
+
+    let evaluated_missing = missing_chain_lengths
+        .into_par_iter()
+        .map(|max_chain_length| {
+            let mut config = PreflateConfig::default();
+            config.verify_compression = true;
+            config.plain_text_limit = ZBPK_MAX_OUTPUT_BYTES;
+            config.max_chain_length = max_chain_length;
+            let evaluated = match preflate_whole_deflate_stream(deflate_stream, &config) {
+                Ok((chunk, plain)) => Some((chunk.corrections, plain.text().to_vec())),
+                Err(_) => None,
+            };
+            (max_chain_length, evaluated)
+        })
+        .collect::<Vec<_>>();
+    for (max_chain_length, evaluated) in evaluated_missing {
+        let cache_key = (deflate_stream_hash, max_chain_length);
+        context
+            .cache
+            .preflate_outputs
+            .insert(cache_key, evaluated.clone());
+        if let Some((corrections, plain)) = evaluated {
+            preflate_results.push((max_chain_length, corrections, plain));
+        }
+    }
+    preflate_results.sort_unstable_by_key(|(max_chain_length, _, _)| *max_chain_length);
+    context.timings.recursive_preflate_ms += preflate_timer.elapsed().as_secs_f64() * 1000.0;
+    if preflate_results.is_empty() {
+        context.push_skipped(
+            "recursive-circuit-xz unavailable: preflate reconstruction failed for all chain candidates"
+        );
+        context.timings.recursive_total_ms += recursive_total_timer.elapsed().as_secs_f64() * 1000.0;
+        return Ok(None);
+    }
+
+    let plain_len = preflate_results[0].2.len();
+    let transformed_template = choose_adaptive_transform_plan(
+        &preflate_results[0].2,
+        context.profile,
+        context.profile.max_transform_plans(),
+    )?;
+    context.timings.recursive_transform_sampling_ms += transformed_template.sampling_ms;
+    context.timings.recursive_transform_eval_ms += transformed_template.eval_ms;
+
+    let correction_timer = Instant::now();
+    let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
+    let profile = context.profile;
+    let evaluated = preflate_results
+        .into_par_iter()
+        .map(|(max_chain_length, corrections, _)| {
+            let (
+                correction_plan,
+                correction_codec,
+                corrections_payload,
+                _correction_sample_ms,
+                _correction_eval_ms,
+            ) = choose_correction_transform_plan(&corrections, profile)?;
+
+            let mut topology = transformed_template.topology.clone();
+            let _ = embed_correction_plan_in_topology(&mut topology, &correction_plan)?;
+
+            let stream = RecursiveCircuitStream {
+                base: base.clone(),
+                transformed_payload: transformed_template.payload.clone(),
+                corrections_payload,
+                plain_len,
+                transformed_encoded_len: transformed_template.payload.len(),
+                correction_plain_len: corrections.len(),
+                correction_encoded_len: 0,
+                transformed_codec: transformed_template.codec,
+                correction_codec,
+                zlib_header,
+                zlib_adler32,
+                transform_plan: transformed_template.plan,
+                topology,
+            };
+            let correction_encoded_len = stream.corrections_payload.len();
+            let mut stream = stream;
+            stream.correction_encoded_len = correction_encoded_len;
+
+            let candidate_total = ZBPK_HEADER_BYTES
+                + recursive_circuit_dictionary_size(&stream)
+                + stream.transformed_encoded_len
+                + stream.correction_encoded_len;
+            if trace_recursive {
+                eprintln!(
+                    "zbit-trace recursive chain={} plan={} period={} head={} transformed={}({}) corrections={}({}) corr-plain={} total={}",
+                    max_chain_length,
+                    stream.transform_plan.kind.name(),
+                    stream.transform_plan.period,
+                    stream.transform_plan.head,
+                    stream.transformed_encoded_len,
+                    stream.transformed_codec.name(),
+                    stream.correction_encoded_len,
+                    stream.correction_codec.name(),
+                    stream.correction_plain_len,
+                    candidate_total,
+                );
+                eprintln!(
+                    "zbit-trace recursive correction-plan={} period={} head={}",
+                    correction_plan.kind.name(),
+                    correction_plan.period,
+                    correction_plan.head
+                );
+            }
+            Ok::<_, ZbitError>((max_chain_length, stream, candidate_total))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?;
+    context.timings.recursive_correction_modeling_ms +=
+        correction_timer.elapsed().as_secs_f64() * 1000.0;
+
+    let Some((_max_chain_length, stream, _)) = evaluated
+        .into_iter()
+        .min_by_key(|(max_chain_length, _, candidate_total)| (*candidate_total, *max_chain_length))
+    else {
+        context.push_skipped("recursive-circuit-xz unavailable: no valid correction model candidate");
+        context.timings.recursive_total_ms += recursive_total_timer.elapsed().as_secs_f64() * 1000.0;
+        return Ok(None);
+    };
+
+    let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
+
+    if trace_recursive {
+        eprintln!(
+            "zbit-trace recursive selected chain plan={} period={} head={} transformed={}({}) corrections={}({}) plain={}",
+            stream.transform_plan.kind.name(),
+            stream.transform_plan.period,
+            stream.transform_plan.head,
+            stream.transformed_encoded_len,
+            stream.transformed_codec.name(),
+            stream.correction_encoded_len,
+            stream.correction_codec.name(),
+            plain_len,
+        );
+    }
+    context.timings.recursive_total_ms += recursive_total_timer.elapsed().as_secs_f64() * 1000.0;
+    Ok(Some(stream))
+}
+
+fn recursive_circuit_dictionary_size(stream: &RecursiveCircuitStream) -> usize {
+    framed_dictionary_size(&stream.base) + 51 + stream.topology.len() * TOPOLOGY_NODE_BYTES
+}
+
+fn write_recursive_circuit_dictionary(out: &mut Vec<u8>, stream: &RecursiveCircuitStream) {
+    write_framed_dictionary(out, &stream.base);
+    out.extend_from_slice(&stream.zlib_header);
+    out.extend_from_slice(&stream.zlib_adler32);
+    push_u64(out, stream.plain_len as u64);
+    push_u64(out, stream.transformed_encoded_len as u64);
+    push_u64(out, stream.correction_plain_len as u64);
+    push_u64(out, stream.correction_encoded_len as u64);
+    out.push(stream.transformed_codec.as_u8());
+    out.push(stream.correction_codec.as_u8());
+    out.push(stream.transform_plan.kind.as_u8());
+    push_u32(out, stream.transform_plan.period);
+    push_u32(out, stream.transform_plan.head);
+    push_u16(out, stream.topology.len() as u16);
+    for node in &stream.topology {
+        push_u32(out, node.id);
+        push_u32(out, node.parent_id);
+        out.push(node.relation);
+        push_u16(out, node.order);
+        out.push(node.kind);
+        push_u32(out, node.param_a);
+        push_u32(out, node.param_b);
+        push_u64(out, node.hash64);
+    }
+}
+
+fn decode_recursive_circuit_payload(
+    dict_bytes: &[u8],
+    payload: &[u8],
+    original_size: usize,
+) -> ZbitResult<Vec<u8>> {
+    let mut dict_cursor = 0usize;
+    let prefix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let suffix_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tag_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 4)
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz missing frame tag".to_string()))?;
+    dict_cursor += 4;
+    let frame_tag = [tag_slice[0], tag_slice[1], tag_slice[2], tag_slice[3]];
+    let base_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let full_chunk_count = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let tail_chunk_len = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+    let total_chunks = read_u32(dict_bytes, &mut dict_cursor)? as usize;
+
+    let prefix = dict_bytes
+        .get(dict_cursor..dict_cursor + prefix_len)
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz prefix range out of bounds".to_string())
+        })?;
+    dict_cursor += prefix_len;
+
+    let suffix = dict_bytes
+        .get(dict_cursor..dict_cursor + suffix_len)
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz suffix range out of bounds".to_string())
+        })?;
+    dict_cursor += suffix_len;
+
+    let zlib_header_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 2)
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz missing zlib header".to_string()))?;
+    dict_cursor += 2;
+    let mut zlib_header = [0u8; 2];
+    zlib_header.copy_from_slice(zlib_header_slice);
+
+    let zlib_adler_slice = dict_bytes
+        .get(dict_cursor..dict_cursor + 4)
+        .ok_or_else(|| ZbitError::Parse("recursive-circuit-xz missing zlib adler32".to_string()))?;
+    dict_cursor += 4;
+    let mut zlib_adler32 = [0u8; 4];
+    zlib_adler32.copy_from_slice(zlib_adler_slice);
+
+    let plain_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let transformed_encoded_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let correction_plain_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let correction_encoded_len = read_u64(dict_bytes, &mut dict_cursor)? as usize;
+    let transformed_codec = PayloadCodec::from_u8(read_u8(dict_bytes, &mut dict_cursor)?)
+        .ok_or_else(|| {
+            ZbitError::Parse(
+                "recursive-circuit-xz dictionary has invalid transformed codec".to_string(),
+            )
+        })?;
+    let correction_codec = PayloadCodec::from_u8(read_u8(dict_bytes, &mut dict_cursor)?)
+        .ok_or_else(|| {
+            ZbitError::Parse(
+                "recursive-circuit-xz dictionary has invalid correction codec".to_string(),
+            )
+        })?;
+    let transform_kind_u8 = read_u8(dict_bytes, &mut dict_cursor)?;
+    let transform_kind = CircuitTransformKind::from_u8(transform_kind_u8).ok_or_else(|| {
+        ZbitError::Parse("recursive-circuit-xz dictionary has invalid transform kind".to_string())
+    })?;
+    let transform_period = read_u32(dict_bytes, &mut dict_cursor)?;
+    let transform_head = read_u32(dict_bytes, &mut dict_cursor)?;
+    let topology_count = read_u16(dict_bytes, &mut dict_cursor)? as usize;
+    let mut correction_plan = CircuitTransformPlan {
+        kind: CircuitTransformKind::Identity,
+        period: 0,
+        head: 0,
+    };
+
+    let mut seen_root = false;
+    let mut last_id = 0u32;
+    let mut hash_by_id = HashMap::<u32, u64>::new();
+    for idx in 0..topology_count {
+        let id = read_u32(dict_bytes, &mut dict_cursor)?;
+        let parent_id = read_u32(dict_bytes, &mut dict_cursor)?;
+        let relation = read_u8(dict_bytes, &mut dict_cursor)?;
+        let order = read_u16(dict_bytes, &mut dict_cursor)?;
+        let kind = read_u8(dict_bytes, &mut dict_cursor)?;
+        let param_a = read_u32(dict_bytes, &mut dict_cursor)?;
+        let param_b = read_u32(dict_bytes, &mut dict_cursor)?;
+        let stored_hash = read_u64(dict_bytes, &mut dict_cursor)?;
+
+        if relation > 1 {
+            return Err(ZbitError::Parse(
+                "recursive-circuit-xz topology relation must be 0 or 1".to_string(),
+            ));
+        }
+        if idx > 0 && id <= last_id {
+            return Err(ZbitError::Parse(
+                "recursive-circuit-xz topology node ids must be strictly increasing".to_string(),
+            ));
+        }
+        if parent_id == u32::MAX {
+            seen_root = true;
+        }
+        let parent_hash = if parent_id == u32::MAX {
+            TOPOLOGY_HASH_OFFSET
+        } else {
+            *hash_by_id.get(&parent_id).ok_or_else(|| {
+                ZbitError::Parse(
+                    "recursive-circuit-xz topology references unknown parent".to_string(),
+                )
+            })?
+        };
+        let mut expected_hash = TOPOLOGY_HASH_OFFSET;
+        expected_hash = topology_hash_mix(expected_hash, parent_hash);
+        expected_hash = topology_hash_mix(expected_hash, id as u64);
+        expected_hash = topology_hash_mix(expected_hash, parent_id as u64);
+        expected_hash = topology_hash_mix(expected_hash, relation as u64);
+        expected_hash = topology_hash_mix(expected_hash, order as u64);
+        expected_hash = topology_hash_mix(expected_hash, kind as u64);
+        expected_hash = topology_hash_mix(expected_hash, param_a as u64);
+        expected_hash = topology_hash_mix(expected_hash, param_b as u64);
+        if stored_hash != expected_hash {
+            return Err(ZbitError::Parse(
+                "recursive-circuit-xz topology hash mismatch".to_string(),
+            ));
+        }
+        if let Some(plan) = decode_embedded_correction_plan(kind, param_a, param_b) {
+            correction_plan = plan;
+        }
+        hash_by_id.insert(id, expected_hash);
+        last_id = id;
+    }
+
+    if dict_cursor != dict_bytes.len() {
+        return Err(ZbitError::Parse(
+            "trailing bytes in recursive-circuit-xz dictionary".to_string(),
+        ));
+    }
+    if topology_count == 0 || !seen_root {
+        return Err(ZbitError::Parse(
+            "recursive-circuit-xz topology metadata missing valid root".to_string(),
+        ));
+    }
+
+    let expected_payload = transformed_encoded_len
+        .checked_add(correction_encoded_len)
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz payload length overflow".to_string())
+        })?;
+    if payload.len() != expected_payload {
+        return Err(ZbitError::Parse(format!(
+            "recursive-circuit-xz payload length mismatch: expected {expected_payload} got {}",
+            payload.len()
+        )));
+    }
+
+    let transformed_payload = &payload[..transformed_encoded_len];
+    let corrections_payload = &payload[transformed_encoded_len..];
+    let transformed = decode_with_codec(transformed_payload, transformed_codec, plain_len)?;
+    let correction_transformed =
+        decode_with_codec(corrections_payload, correction_codec, correction_plain_len)?;
+    let corrections = invert_transform_plan(
+        &correction_transformed,
+        correction_plain_len,
+        &correction_plan,
+    )
+    .ok_or_else(|| {
+        ZbitError::Parse("recursive-circuit-xz correction stream is invalid".to_string())
+    })?;
+    let plan = CircuitTransformPlan {
+        kind: transform_kind,
+        period: transform_period,
+        head: transform_head,
+    };
+    let filtered_plain =
+        invert_transform_plan(&transformed, plain_len, &plan).ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz transformed stream is invalid".to_string())
+        })?;
+
+    let deflate_stream = recreate_whole_deflate_stream(&filtered_plain, &corrections)
+        .map_err(|e| ZbitError::Parse(format!("preflate recreate failed: {e}")))?;
+
+    let mut framed_payload = Vec::with_capacity(
+        2usize
+            .checked_add(deflate_stream.len())
+            .and_then(|v| v.checked_add(4))
+            .ok_or_else(|| {
+                ZbitError::Parse("recursive-circuit-xz framed payload overflow".to_string())
+            })?,
+    );
+    framed_payload.extend_from_slice(&zlib_header);
+    framed_payload.extend_from_slice(&deflate_stream);
+    framed_payload.extend_from_slice(&zlib_adler32);
+
+    let tail_present = if total_chunks == full_chunk_count {
+        false
+    } else if total_chunks == full_chunk_count + 1 {
+        true
+    } else {
+        return Err(ZbitError::Parse(
+            "recursive-circuit-xz dictionary has inconsistent chunk counters".to_string(),
+        ));
+    };
+
+    let expected_framed_payload = full_chunk_count
+        .checked_mul(base_chunk_len)
+        .and_then(|v| {
+            if tail_present {
+                v.checked_add(tail_chunk_len)
+            } else {
+                Some(v)
+            }
+        })
+        .ok_or_else(|| {
+            ZbitError::Parse("recursive-circuit-xz framed length overflow".to_string())
+        })?;
+    if framed_payload.len() != expected_framed_payload {
+        return Err(ZbitError::Parse(format!(
+            "recursive-circuit-xz framed length mismatch: expected {expected_framed_payload} got {}",
+            framed_payload.len()
+        )));
+    }
+
+    let chunk_overhead = total_chunks.checked_mul(12).ok_or_else(|| {
+        ZbitError::Parse("recursive-circuit-xz chunk overhead overflow".to_string())
+    })?;
+    let mut out = Vec::with_capacity(
+        prefix
+            .len()
+            .checked_add(framed_payload.len())
+            .and_then(|v| v.checked_add(suffix.len()))
+            .and_then(|v| v.checked_add(chunk_overhead))
+            .ok_or_else(|| {
+                ZbitError::Parse("recursive-circuit-xz output length overflow".to_string())
+            })?,
+    );
+    out.extend_from_slice(prefix);
+
+    let mut payload_cursor = 0usize;
+    for idx in 0..total_chunks {
+        let chunk_len = if idx < full_chunk_count {
+            base_chunk_len
+        } else {
+            tail_chunk_len
+        };
+        let chunk_data = framed_payload
+            .get(payload_cursor..payload_cursor + chunk_len)
+            .ok_or_else(|| {
+                ZbitError::Parse("recursive-circuit-xz frame range out of bounds".to_string())
+            })?;
+        payload_cursor += chunk_len;
+
+        push_u32_be(&mut out, chunk_len as u32);
+        out.extend_from_slice(&frame_tag);
+        out.extend_from_slice(chunk_data);
+
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&frame_tag);
+        hasher.update(chunk_data);
+        push_u32_be(&mut out, hasher.finalize());
+    }
+
+    out.extend_from_slice(suffix);
+
+    if out.len() != original_size {
+        return Err(ZbitError::Parse(format!(
+            "recursive-circuit-xz output length mismatch: expected {original_size} got {}",
+            out.len()
+        )));
+    }
+
+    Ok(out)
+}
+
