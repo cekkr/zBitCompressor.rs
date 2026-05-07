@@ -1,5 +1,5 @@
 zBit-rs Stream Benchmark Report
-Generated: 2026-05-07 11:04:04
+Generated: 2026-05-07 12:16:31
 Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge_stream.zbps
 
@@ -10,6 +10,7 @@ Streaming settings:
 - max group pieces: 8
 - carry grouping history: true
 - realtime mode: true
+- wide overfitting circuits: true
 
 Stream topology:
 - total chunks: 12
@@ -23,14 +24,14 @@ Stream topology:
 - key-piece decode note: receiver can start from chunk indices that are multiples of 8 (block/key boundaries)
 
 Original size (bytes): 2969404
-Compressed size (bytes): 2965318
-Compression ratio (compressed/original): 0.998624
-Space savings (%): 0.14
+Compressed size (bytes): 2670846
+Compression ratio (compressed/original): 0.899455
+Space savings (%): 10.05
 
-Compression time (ms): 6418.050
-Decompression time (ms): 8.215
-Compression throughput (MiB/s): 0.441
-Decompression throughput (MiB/s): 344.701
+Compression time (ms): 612103.486
+Decompression time (ms): 9493.562
+Compression throughput (MiB/s): 0.005
+Decompression throughput (MiB/s): 0.298
 
 Output validation: PASS
 Key-piece resume validation: PASS

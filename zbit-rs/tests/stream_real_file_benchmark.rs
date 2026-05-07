@@ -37,6 +37,7 @@ fn adaptive_stream_pack_real_file_roundtrip_and_key_piece_resume() {
             max_group_pieces: 4,
             carry_grouping_history: true,
             realtime_mode: true,
+            wide_overfitting_circuits: true,
         };
 
         let stats = compress_adaptive_stream_to_file(&input, &pack_path, &options)

@@ -28,7 +28,10 @@ const ZBPS_BLOCK_HEADER_BYTES: usize = 21;
 const ZBPS_NODE_KIND_PIECE: u8 = 0;
 const ZBPS_NODE_KIND_GROUP: u8 = 1;
 const ZBPS_NODE_KIND_SPLIT: u8 = 2;
+const ZBPS_NODE_KIND_GLOBAL_SLICE: u8 = 3;
 const ZBPS_HISTORY_NONE: u8 = u8::MAX;
+const ZBPS_FLAG_CARRY_GROUPING_HISTORY: u16 = 0x0001;
+const ZBPS_FLAG_WIDE_OVERFITTING_CIRCUITS: u16 = 0x0002;
 const MAX_HUFFMAN_CODE_BITS: u8 = 56;
 const ZBPK_MAX_OUTPUT_BYTES: usize = 1usize << 30; // 1 GiB hard safety bound
 
@@ -69,6 +72,7 @@ pub struct StreamPackOptions {
     pub max_group_pieces: usize,
     pub carry_grouping_history: bool,
     pub realtime_mode: bool,
+    pub wide_overfitting_circuits: bool,
 }
 
 impl Default for StreamPackOptions {
@@ -80,6 +84,7 @@ impl Default for StreamPackOptions {
             max_group_pieces: 8,
             carry_grouping_history: true,
             realtime_mode: true,
+            wide_overfitting_circuits: true,
         }
     }
 }
@@ -346,6 +351,7 @@ struct DecodeNode {
 
 #[derive(Debug, Clone, Copy)]
 struct StreamHeader {
+    flags: u16,
     chunk_size: usize,
     key_piece_interval: usize,
     original_size: usize,
@@ -377,6 +383,11 @@ enum StreamNodeKind {
         level: u8,
         left: Box<StreamNode>,
         right: Box<StreamNode>,
+    },
+    GlobalSlice {
+        chunk_count: usize,
+        original_offset: usize,
+        original_len: usize,
     },
 }
 
@@ -4157,6 +4168,109 @@ fn compress_stream_realtime_pack_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, Pac
     Ok((bytes, method))
 }
 
+fn compress_stream_wide_overfit_pack_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, PackMethod)> {
+    let raw_deflate_payload = build_raw_deflate_payload(input)?;
+    let raw_zstd_payload = build_raw_zstd_payload(input)?;
+
+    let empty_stream = IndexStream {
+        unique_symbols: Vec::new(),
+        bits_per_symbol: 0,
+        payload: Vec::new(),
+        frequencies: [0u32; 256],
+    };
+
+    let raw_copy_bytes = write_pack_bytes(
+        PackMethod::RawCopy,
+        input,
+        &empty_stream,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    let raw_deflate_bytes = write_pack_bytes(
+        PackMethod::RawDeflate,
+        input,
+        &empty_stream,
+        None,
+        0,
+        None,
+        Some(raw_deflate_payload.as_slice()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    let raw_zstd_bytes = write_pack_bytes(
+        PackMethod::RawZstd,
+        input,
+        &empty_stream,
+        None,
+        0,
+        None,
+        None,
+        Some(raw_zstd_payload.as_slice()),
+        None,
+        None,
+        None,
+        None,
+    )?;
+
+    let mut candidates = vec![
+        (PackMethod::RawCopy, raw_copy_bytes),
+        (PackMethod::RawDeflate, raw_deflate_bytes),
+        (PackMethod::RawZstd, raw_zstd_bytes),
+    ];
+
+    if let Some(framed_run) = build_framed_payload_run(input) {
+        let framed_bytes = write_pack_bytes(
+            PackMethod::FramedRaw,
+            input,
+            &empty_stream,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(&framed_run),
+            None,
+            None,
+        )?;
+        candidates.push((PackMethod::FramedRaw, framed_bytes));
+
+        if let Some(recursive_stream) = build_recursive_circuit_stream(input, &framed_run)? {
+            let recursive_bytes = write_pack_bytes(
+                PackMethod::RecursiveCircuitXz,
+                input,
+                &empty_stream,
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&recursive_stream),
+                None,
+            )?;
+            candidates.push((PackMethod::RecursiveCircuitXz, recursive_bytes));
+        }
+    }
+
+    candidates.sort_by_key(|(_, bytes)| bytes.len());
+    let (method, bytes) = candidates.into_iter().next().ok_or_else(|| {
+        ZbitError::Internal("missing stream wide-overfit pack candidate".to_string())
+    })?;
+    Ok((bytes, method))
+}
+
 fn compress_stream_range_pack_bytes(
     input: &[u8],
     realtime_mode: bool,
@@ -4243,6 +4357,29 @@ fn stream_group_node(
             original_len,
             method,
             pack_bytes,
+        },
+        chunk_count,
+        original_len,
+        encoded_size,
+    })
+}
+
+fn stream_global_slice_node(
+    chunk_count: usize,
+    original_offset: usize,
+    original_len: usize,
+) -> ZbitResult<StreamNode> {
+    let encoded_size = 1usize
+        .checked_add(4)
+        .and_then(|v| v.checked_add(8))
+        .and_then(|v| v.checked_add(8))
+        .ok_or_else(|| ZbitError::Limit("stream global-slice node size overflow".to_string()))?;
+
+    Ok(StreamNode {
+        kind: StreamNodeKind::GlobalSlice {
+            chunk_count,
+            original_offset,
+            original_len,
         },
         chunk_count,
         original_len,
@@ -4374,6 +4511,7 @@ fn collect_stream_node_counts(node: &StreamNode, depth: u8, counts: &mut StreamN
     match &node.kind {
         StreamNodeKind::Piece { .. } => counts.piece_nodes += 1,
         StreamNodeKind::Group { .. } => counts.grouped_nodes += 1,
+        StreamNodeKind::GlobalSlice { .. } => counts.grouped_nodes += 1,
         StreamNodeKind::Split { left, right, .. } => {
             counts.split_nodes += 1;
             collect_stream_node_counts(left, depth.saturating_add(1), counts);
@@ -4385,6 +4523,7 @@ fn collect_stream_node_counts(node: &StreamNode, depth: u8, counts: &mut StreamN
 fn stream_node_history_method(node: &StreamNode) -> PackMethod {
     match &node.kind {
         StreamNodeKind::Piece { method, .. } | StreamNodeKind::Group { method, .. } => *method,
+        StreamNodeKind::GlobalSlice { .. } => PackMethod::RecursiveCircuitXz,
         StreamNodeKind::Split { left, right, .. } => {
             if left.original_len >= right.original_len {
                 stream_node_history_method(left)
@@ -4439,11 +4578,34 @@ fn write_stream_node(out: &mut Vec<u8>, node: &StreamNode) -> ZbitResult<()> {
             write_stream_node(out, left)?;
             write_stream_node(out, right)?;
         }
+        StreamNodeKind::GlobalSlice {
+            chunk_count,
+            original_offset,
+            original_len,
+        } => {
+            out.push(ZBPS_NODE_KIND_GLOBAL_SLICE);
+            push_u32(
+                out,
+                usize_to_u32(*chunk_count, "stream global-slice chunk_count")?,
+            );
+            push_u64(
+                out,
+                usize_to_u64(*original_offset, "stream global-slice original_offset")?,
+            );
+            push_u64(
+                out,
+                usize_to_u64(*original_len, "stream global-slice original_len")?,
+            );
+        }
     }
     Ok(())
 }
 
-fn decode_stream_node(node_bytes: &[u8], cursor: &mut usize) -> ZbitResult<StreamDecodedNode> {
+fn decode_stream_node(
+    node_bytes: &[u8],
+    cursor: &mut usize,
+    global_output: Option<&[u8]>,
+) -> ZbitResult<StreamDecodedNode> {
     let kind = read_u8(node_bytes, cursor)?;
     match kind {
         ZBPS_NODE_KIND_PIECE => {
@@ -4520,8 +4682,8 @@ fn decode_stream_node(node_bytes: &[u8], cursor: &mut usize) -> ZbitResult<Strea
         }
         ZBPS_NODE_KIND_SPLIT => {
             let _level = read_u8(node_bytes, cursor)?;
-            let left = decode_stream_node(node_bytes, cursor)?;
-            let right = decode_stream_node(node_bytes, cursor)?;
+            let left = decode_stream_node(node_bytes, cursor, global_output)?;
+            let right = decode_stream_node(node_bytes, cursor, global_output)?;
 
             let mut bytes = Vec::with_capacity(
                 left.bytes
@@ -4536,6 +4698,35 @@ fn decode_stream_node(node_bytes: &[u8], cursor: &mut usize) -> ZbitResult<Strea
                 .chunk_count
                 .checked_add(right.chunk_count)
                 .ok_or_else(|| ZbitError::Limit("stream split chunk count overflow".to_string()))?;
+
+            Ok(StreamDecodedNode { bytes, chunk_count })
+        }
+        ZBPS_NODE_KIND_GLOBAL_SLICE => {
+            let chunk_count = read_u32(node_bytes, cursor)? as usize;
+            let original_offset = u64_to_usize(
+                read_u64(node_bytes, cursor)?,
+                "stream global-slice original_offset",
+            )?;
+            let original_len = u64_to_usize(
+                read_u64(node_bytes, cursor)?,
+                "stream global-slice original_len",
+            )?;
+
+            let global = global_output.ok_or_else(|| {
+                ZbitError::Parse(
+                    "stream global-slice node missing global overfit payload".to_string(),
+                )
+            })?;
+
+            let range_end = original_offset.checked_add(original_len).ok_or_else(|| {
+                ZbitError::Parse("stream global-slice range overflow".to_string())
+            })?;
+            let bytes = global
+                .get(original_offset..range_end)
+                .ok_or_else(|| {
+                    ZbitError::Parse("stream global-slice range out of bounds".to_string())
+                })?
+                .to_vec();
 
             Ok(StreamDecodedNode { bytes, chunk_count })
         }
@@ -4559,7 +4750,7 @@ fn parse_stream_header(bytes: &[u8], cursor: &mut usize) -> ZbitResult<StreamHea
     }
 
     let flags = read_u16(bytes, cursor)?;
-    if flags & !0x0001u16 != 0 {
+    if flags & !(ZBPS_FLAG_CARRY_GROUPING_HISTORY | ZBPS_FLAG_WIDE_OVERFITTING_CIRCUITS) != 0 {
         return Err(ZbitError::Parse(format!(
             "unsupported ZBPS flags: 0x{flags:04x}"
         )));
@@ -4615,6 +4806,7 @@ fn parse_stream_header(bytes: &[u8], cursor: &mut usize) -> ZbitResult<StreamHea
     }
 
     Ok(StreamHeader {
+        flags,
         chunk_size,
         key_piece_interval,
         original_size,
@@ -4637,6 +4829,158 @@ fn compress_stream_to_bytes(
         (total_chunks + options.key_piece_interval - 1) / options.key_piece_interval
     };
 
+    let mut flags = 0u16;
+    if options.carry_grouping_history {
+        flags |= ZBPS_FLAG_CARRY_GROUPING_HISTORY;
+    }
+    if options.wide_overfitting_circuits {
+        flags |= ZBPS_FLAG_WIDE_OVERFITTING_CIRCUITS;
+    }
+
+    if options.wide_overfitting_circuits {
+        let (global_pack_bytes, global_method) = compress_stream_wide_overfit_pack_bytes(input)?;
+        let mut out = Vec::with_capacity(
+            ZBPS_HEADER_BYTES
+                .checked_add(4)
+                .and_then(|v| v.checked_add(global_pack_bytes.len()))
+                .and_then(|v| {
+                    v.checked_add(
+                        block_count
+                            .checked_mul(
+                                ZBPS_BLOCK_HEADER_BYTES
+                                    .checked_add(1 + 4 + 8 + 8)
+                                    .unwrap_or(0),
+                            )
+                            .unwrap_or(0),
+                    )
+                })
+                .ok_or_else(|| {
+                    ZbitError::Limit("stream wide-overfit output size overflow".to_string())
+                })?,
+        );
+
+        push_u32(&mut out, ZBPS_MAGIC);
+        push_u16(&mut out, ZBPS_VERSION);
+        push_u16(&mut out, flags);
+        push_u32(
+            &mut out,
+            usize_to_u32(options.chunk_size, "stream chunk_size")?,
+        );
+        push_u32(
+            &mut out,
+            usize_to_u32(options.key_piece_interval, "stream key_piece_interval")?,
+        );
+        out.push(options.max_group_depth);
+        out.extend_from_slice(&[0u8; 3]);
+        push_u32(
+            &mut out,
+            usize_to_u32(options.max_group_pieces, "stream max_group_pieces")?,
+        );
+        push_u64(
+            &mut out,
+            usize_to_u64(input.len(), "stream original input size")?,
+        );
+        push_u32(&mut out, usize_to_u32(total_chunks, "stream total_chunks")?);
+        push_u32(&mut out, usize_to_u32(block_count, "stream block_count")?);
+
+        push_u32(
+            &mut out,
+            usize_to_u32(
+                global_pack_bytes.len(),
+                "stream wide-overfit global pack bytes length",
+            )?,
+        );
+        out.extend_from_slice(&global_pack_bytes);
+
+        let mut counts = StreamNodeCounts::default();
+        let mut grouping_hint_updates = 0usize;
+        let mut history_method: Option<PackMethod> = None;
+
+        for block_index in 0..block_count {
+            let block_start = block_index * options.key_piece_interval;
+            let block_end = (block_start + options.key_piece_interval).min(total_chunks);
+            let block_chunk_count = block_end - block_start;
+            let block_original_len = expected_stream_block_len(
+                input.len(),
+                options.chunk_size,
+                total_chunks,
+                block_start,
+                block_chunk_count,
+            )?;
+            let block_offset = block_start.checked_mul(options.chunk_size).ok_or_else(|| {
+                ZbitError::Limit("stream wide-overfit block offset overflow".to_string())
+            })?;
+
+            let root =
+                stream_global_slice_node(block_chunk_count, block_offset, block_original_len)?;
+            collect_stream_node_counts(&root, 0, &mut counts);
+
+            let mut node_bytes = Vec::with_capacity(root.encoded_size);
+            write_stream_node(&mut node_bytes, &root)?;
+            if node_bytes.len() != root.encoded_size {
+                return Err(ZbitError::Internal(format!(
+                    "stream wide-overfit node encoded size mismatch: expected {}, got {}",
+                    root.encoded_size,
+                    node_bytes.len()
+                )));
+            }
+
+            push_u32(
+                &mut out,
+                usize_to_u32(block_start, "stream block first_chunk_index")?,
+            );
+            push_u32(
+                &mut out,
+                usize_to_u32(block_chunk_count, "stream block chunk_count")?,
+            );
+            push_u64(
+                &mut out,
+                usize_to_u64(block_original_len, "stream block original_len")?,
+            );
+            let history_field = if options.carry_grouping_history {
+                history_method
+                    .map(|method| method.as_u8())
+                    .unwrap_or(ZBPS_HISTORY_NONE)
+            } else {
+                ZBPS_HISTORY_NONE
+            };
+            out.push(history_field);
+            if history_field != ZBPS_HISTORY_NONE {
+                grouping_hint_updates = grouping_hint_updates.saturating_add(1);
+            }
+            push_u32(
+                &mut out,
+                usize_to_u32(node_bytes.len(), "stream block node bytes")?,
+            );
+            out.extend_from_slice(&node_bytes);
+
+            history_method = Some(global_method);
+        }
+
+        let stats = StreamPackStats {
+            original_size: input.len(),
+            compressed_size: out.len(),
+            chunk_size: options.chunk_size,
+            total_chunks,
+            key_piece_interval: options.key_piece_interval,
+            key_piece_count: block_count,
+            block_count,
+            max_group_depth: options.max_group_depth,
+            max_group_pieces: options.max_group_pieces,
+            piece_node_count: counts.piece_nodes,
+            grouped_node_count: counts.grouped_nodes,
+            split_node_count: counts.split_nodes,
+            max_depth_used: counts.max_depth_used,
+            grouping_hint_updates,
+            key_piece_decode_note: format!(
+                "receiver can start from chunk indices that are multiples of {} (block/key boundaries)",
+                options.key_piece_interval
+            ),
+        };
+
+        return Ok((out, stats));
+    }
+
     let mut out = Vec::with_capacity(
         ZBPS_HEADER_BYTES
             .checked_add(
@@ -4649,10 +4993,6 @@ fn compress_stream_to_bytes(
 
     push_u32(&mut out, ZBPS_MAGIC);
     push_u16(&mut out, ZBPS_VERSION);
-    let mut flags = 0u16;
-    if options.carry_grouping_history {
-        flags |= 0x0001;
-    }
     push_u16(&mut out, flags);
     push_u32(
         &mut out,
@@ -4791,6 +5131,26 @@ fn decompress_stream_from_bytes(
         )));
     }
 
+    let has_wide_overfitting_payload = (header.flags & ZBPS_FLAG_WIDE_OVERFITTING_CIRCUITS) != 0;
+    let global_overfit_output = if has_wide_overfitting_payload {
+        let global_pack_len = read_u32(bytes, &mut cursor)? as usize;
+        let global_pack_bytes = bytes.get(cursor..cursor + global_pack_len).ok_or_else(|| {
+            ZbitError::Parse("stream global overfit payload range out of bounds".to_string())
+        })?;
+        cursor += global_pack_len;
+        let decoded = decompress_pack_bytes(global_pack_bytes)?;
+        if decoded.len() != header.original_size {
+            return Err(ZbitError::Parse(format!(
+                "stream global overfit output length mismatch: expected {} got {}",
+                header.original_size,
+                decoded.len()
+            )));
+        }
+        Some(decoded)
+    } else {
+        None
+    };
+
     if let Some(key_piece_index) = start_key_piece {
         if key_piece_index >= header.total_chunks {
             return Err(ZbitError::InvalidArg(
@@ -4858,7 +5218,11 @@ fn decompress_stream_from_bytes(
         }
 
         let mut node_cursor = 0usize;
-        let decoded = decode_stream_node(node_bytes, &mut node_cursor)?;
+        let decoded = decode_stream_node(
+            node_bytes,
+            &mut node_cursor,
+            global_overfit_output.as_deref(),
+        )?;
         if node_cursor != node_bytes.len() {
             return Err(ZbitError::Parse(
                 "trailing bytes in stream block node".to_string(),

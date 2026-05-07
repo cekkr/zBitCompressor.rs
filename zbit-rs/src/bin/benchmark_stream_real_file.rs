@@ -118,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_group_pieces,
         carry_grouping_history: true,
         realtime_mode: true,
+        wide_overfitting_circuits: true,
     };
 
     let input = fs::read(&input_path)?;
@@ -180,6 +181,7 @@ Streaming settings:\n\
 - max group pieces: {max_group_pieces}\n\
 - carry grouping history: true\n\
 - realtime mode: true\n\
+- wide overfitting circuits: true\n\
 \n\
 Stream topology:\n\
 - total chunks: {total_chunks}\n\
