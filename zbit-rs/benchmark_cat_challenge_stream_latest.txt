@@ -1,5 +1,5 @@
 zBit-rs Stream Benchmark Report
-Generated: 2026-05-07 19:34:27
+Generated: 2026-05-07 21:06:58
 Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge_stream.zbps
 
@@ -32,34 +32,39 @@ Compressed size (bytes): 2670846
 Compression ratio (compressed/original): 0.899455
 Space savings (%): 10.05
 
-Compression time (ms): 115086.113
-Decompression time (ms): 9613.753
+Compression time (ms): 112944.612
+Decompression time (ms): 9580.205
 Compression throughput (MiB/s): 0.025
-Decompression throughput (MiB/s): 0.295
+Decompression throughput (MiB/s): 0.296
 
 Candidate timing breakdown (ms):
 - raw-deflate encode: 0.000
 - raw-zstd encode: 0.000
 - framed extraction: 0.000
-- recursive preflate search: 41226.028
-- recursive transform sampling: 863.618
-- recursive transform evaluation: 43890.719
-- recursive correction modeling: 7390.464
-- recursive total: 100154.752
-- stream global/shared payload build: 115082.000
+- recursive preflate search: 41653.969
+- recursive transform sampling: 864.189
+- recursive transform evaluation: 41068.447
+- recursive correction modeling: 7407.369
+- recursive total: 97849.612
+- stream global/shared payload build: 112917.543
 - stream block planning: 0.000
-- candidate validation: 9665.909
+- candidate validation: 9591.990
+
+Cache stats:
+- codec hits/misses: 0/0
+- preflate hits/misses: 0/3
+- stream-range hits/misses: 0/0
 
 Skipped candidates:
 - none
 
 Resource usage (KiB):
-- RSS before compression: 5932
-- RSS after compression: 488924
-- RSS after decompression: 490780
-- Compression RSS delta: 482992
-- Decompression RSS delta: 1856
-- Peak RSS (VmHWM): 3357636
+- RSS before compression: 5852
+- RSS after compression: 593764
+- RSS after decompression: 599624
+- Compression RSS delta: 587912
+- Decompression RSS delta: 5860
+- Peak RSS (VmHWM): 3392420
 
 Output validation: PASS
 Key-piece resume validation: PASS

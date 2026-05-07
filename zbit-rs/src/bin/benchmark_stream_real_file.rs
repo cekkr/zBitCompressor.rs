@@ -274,6 +274,11 @@ Candidate timing breakdown (ms):\n\
 - stream block planning: {stream_block_planning_ms:.3}\n\
 - candidate validation: {candidate_validation_ms:.3}\n\
 \n\
+Cache stats:\n\
+- codec hits/misses: {codec_hits}/{codec_misses}\n\
+- preflate hits/misses: {preflate_hits}/{preflate_misses}\n\
+- stream-range hits/misses: {stream_range_hits}/{stream_range_misses}\n\
+\n\
 Skipped candidates:\n\
 {skipped_candidates}\n\
 \n\
@@ -326,6 +331,12 @@ Key-piece resume validation: {key_resume}\n",
         stream_global_payload_ms = stats.timings.stream_global_payload_ms,
         stream_block_planning_ms = stats.timings.stream_block_planning_ms,
         candidate_validation_ms = stats.timings.candidate_validation_ms,
+        codec_hits = stats.cache_stats.codec_hits,
+        codec_misses = stats.cache_stats.codec_misses,
+        preflate_hits = stats.cache_stats.preflate_hits,
+        preflate_misses = stats.cache_stats.preflate_misses,
+        stream_range_hits = stats.cache_stats.stream_range_hits,
+        stream_range_misses = stats.cache_stats.stream_range_misses,
         skipped_candidates = skipped_candidates,
         rss_before = format_opt_u64(rss_before_compress),
         rss_after_comp = format_opt_u64(rss_after_compress),

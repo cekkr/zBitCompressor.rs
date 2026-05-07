@@ -210,6 +210,11 @@ Candidate timing breakdown (ms):\n\
 - recursive total: {recursive_total_ms:.3}\n\
 - candidate validation: {candidate_validation_ms:.3}\n\
 \n\
+Cache stats:\n\
+- codec hits/misses: {codec_hits}/{codec_misses}\n\
+- preflate hits/misses: {preflate_hits}/{preflate_misses}\n\
+- stream-range hits/misses: {stream_range_hits}/{stream_range_misses}\n\
+\n\
 Resource usage (KiB):\n\
 - RSS before compression: {rss_before}\n\
 - RSS after compression: {rss_after_comp}\n\
@@ -285,6 +290,12 @@ Output validation: {valid}\n",
         recursive_correction_modeling_ms = stats.timings.recursive_correction_modeling_ms,
         recursive_total_ms = stats.timings.recursive_total_ms,
         candidate_validation_ms = stats.timings.candidate_validation_ms,
+        codec_hits = stats.cache_stats.codec_hits,
+        codec_misses = stats.cache_stats.codec_misses,
+        preflate_hits = stats.cache_stats.preflate_hits,
+        preflate_misses = stats.cache_stats.preflate_misses,
+        stream_range_hits = stats.cache_stats.stream_range_hits,
+        stream_range_misses = stats.cache_stats.stream_range_misses,
         rss_before = format_opt_u64(rss_before_compress),
         rss_after_comp = format_opt_u64(rss_after_compress),
         rss_after_decomp = format_opt_u64(rss_after_decompress),
