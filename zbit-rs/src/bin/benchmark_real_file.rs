@@ -150,6 +150,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let now = format_timestamp_local(SystemTime::now());
+    let skipped_candidates = if stats.skipped_candidates.is_empty() {
+        "- none".to_string()
+    } else {
+        stats
+            .skipped_candidates
+            .iter()
+            .map(|entry| format!("- {entry}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     let report = format!(
         "zBit-rs Real File Benchmark Report\n\
@@ -157,9 +167,13 @@ Generated: {now}\n\
 Input file: {input_path}\n\
 Compressed artifact: {pack_path}\n\
 \n\
+Active profile: {active_profile}\n\
 Selected method: {method}\n\
 Selection reason: {reason}\n\
 Circuit evaluation rule: {rule}\n\
+\n\
+Skipped candidates:\n\
+{skipped_candidates}\n\
 \n\
 Raw candidate size (bytes): {raw_candidate}\n\
 Indexed-raw candidate size (bytes): {indexed_raw_candidate}\n\
@@ -182,6 +196,20 @@ Decompression time (ms): {decomp_ms:.3}\n\
 Compression throughput (MiB/s): {comp_mibs:.3}\n\
 Decompression throughput (MiB/s): {decomp_mibs:.3}\n\
 \n\
+Candidate timing breakdown (ms):\n\
+- index stream build: {index_stream_ms:.3}\n\
+- huffman stream build: {huffman_stream_ms:.3}\n\
+- raw-deflate encode: {raw_deflate_ms:.3}\n\
+- raw-zstd encode: {raw_zstd_ms:.3}\n\
+- raw-xz encode: {raw_xz_ms:.3}\n\
+- framed extraction: {framed_extraction_ms:.3}\n\
+- recursive preflate search: {recursive_preflate_ms:.3}\n\
+- recursive transform sampling: {recursive_transform_sampling_ms:.3}\n\
+- recursive transform evaluation: {recursive_transform_eval_ms:.3}\n\
+- recursive correction modeling: {recursive_correction_modeling_ms:.3}\n\
+- recursive total: {recursive_total_ms:.3}\n\
+- candidate validation: {candidate_validation_ms:.3}\n\
+\n\
 Resource usage (KiB):\n\
 - RSS before compression: {rss_before}\n\
 - RSS after compression: {rss_after_comp}\n\
@@ -198,9 +226,11 @@ Huffman dictionary bytes: {huffman_dict}\n\
 Packed index payload bytes: {payload}\n\
 \n\
 Output validation: {valid}\n",
+        active_profile = stats.active_profile,
         method = stats.chosen_method.name(),
         reason = stats.chosen_reason,
         rule = stats.circuit_rule_note,
+        skipped_candidates = skipped_candidates,
         raw_candidate = stats.raw_candidate_bytes,
         indexed_raw_candidate = stats.indexed_raw_candidate_bytes,
         indexed_circuit = stats
@@ -243,6 +273,18 @@ Output validation: {valid}\n",
         decomp_ms = decompression_s * 1000.0,
         comp_mibs = compression_mibs,
         decomp_mibs = decompression_mibs,
+        index_stream_ms = stats.timings.index_stream_ms,
+        huffman_stream_ms = stats.timings.huffman_stream_ms,
+        raw_deflate_ms = stats.timings.raw_deflate_ms,
+        raw_zstd_ms = stats.timings.raw_zstd_ms,
+        raw_xz_ms = stats.timings.raw_xz_ms,
+        framed_extraction_ms = stats.timings.framed_extraction_ms,
+        recursive_preflate_ms = stats.timings.recursive_preflate_ms,
+        recursive_transform_sampling_ms = stats.timings.recursive_transform_sampling_ms,
+        recursive_transform_eval_ms = stats.timings.recursive_transform_eval_ms,
+        recursive_correction_modeling_ms = stats.timings.recursive_correction_modeling_ms,
+        recursive_total_ms = stats.timings.recursive_total_ms,
+        candidate_validation_ms = stats.timings.candidate_validation_ms,
         rss_before = format_opt_u64(rss_before_compress),
         rss_after_comp = format_opt_u64(rss_after_compress),
         rss_after_decomp = format_opt_u64(rss_after_decompress),

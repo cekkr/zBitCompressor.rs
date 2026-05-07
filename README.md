@@ -213,6 +213,9 @@ cargo run --manifest-path zbit-rs/Cargo.toml --bin zbit-benchmark-stream -- \
 Optional trailing flags: `realtime_mode`, `wide_overfitting_circuits`, `carry_grouping_history`
 as boolean values (`true`/`false` or `1`/`0`).
 
+Compression profile control is available for both real-file and stream paths via
+`ZBIT_COMPRESSION_PROFILE` (`fast`, `balanced`, `deep`, `research`), defaulting to `balanced`.
+
 Run the cat challenge streaming benchmark script (auto-download if missing):
 
 ```bash
@@ -233,19 +236,19 @@ Current snapshot (reports generated on 2026-05-07):
 
 | Test | Input | Selected method/profile | Original -> Compressed (bytes) | Ratio | Savings | Compression ms | Decompression ms | Peak RSS KiB | Validation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `328.969` | `1.102` | `87332` | `PASS` |
-| Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `28383.045` | `148.948` | `126184` | `PASS` |
-| Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `617251.656` | `9464.538` | `220928` | `PASS` |
-| Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `621159.756` | `9480.250` | `226544` | `PASS` |
+| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `229.356` | `1.215` | `143612` | `PASS` |
+| Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `16414.882` | `145.228` | `589884` | `PASS` |
+| Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `100856.977` | `9604.561` | `3367984` | `PASS` |
+| Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `108493.158` | `9576.912` | `3374264` | `PASS` |
 
 ### Latest Cat Stream Multilevel Profiles
 
 | Profile | Ratio | Savings | Original -> Compressed (bytes) | Compression ms | Decompression ms | Compression MiB/s | Decompression MiB/s | Compression RSS delta KiB | Decompression RSS delta KiB | Peak RSS KiB | Validation | Resume |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `realtime-fast` | `0.899597` | `10.04%` | `2969404 -> 2671266` | `649139.666` | `9483.398` | `0.004` | `0.299` | `77584` | `0` | `226916` | `PASS` | `PASS` |
-| `realtime-balanced` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `1079593.691` | `9474.312` | `0.003` | `0.299` | `123164` | `0` | `233564` | `PASS` | `PASS` |
-| `realtime-deep` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `1054402.704` | `9461.109` | `0.003` | `0.299` | `143916` | `0` | `256076` | `PASS` | `PASS` |
-| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `622578.055` | `9486.900` | `0.005` | `0.299` | `74640` | `0` | `226752` | `PASS` | `PASS` |
+| `realtime-fast` | `0.899597` | `10.04%` | `2969404 -> 2671266` | `123852.543` | `9595.877` | `0.023` | `0.295` | `554228` | `36372` | `3393380` | `PASS` | `PASS` |
+| `realtime-balanced` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `124218.269` | `9590.621` | `0.023` | `0.295` | `486200` | `15820` | `3376808` | `PASS` | `PASS` |
+| `realtime-deep` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `127240.705` | `9581.806` | `0.022` | `0.296` | `571988` | `0` | `3361376` | `PASS` | `PASS` |
+| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `108249.214` | `9639.225` | `0.026` | `0.294` | `465488` | `3536` | `3397000` | `PASS` | `PASS` |
 
 Latest outputs for the tracked tests are written to:
 

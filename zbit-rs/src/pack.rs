@@ -6,6 +6,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use crate::error::{ZbitError, ZbitResult};
 use crate::model::ZbitModel;
@@ -13,6 +14,7 @@ use crate::pack_rules::{choose_best_method, should_evaluate_circuit, PackEvaluat
 use crc32fast::Hasher as Crc32Hasher;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use preflate_rs::{preflate_whole_deflate_stream, recreate_whole_deflate_stream, PreflateConfig};
+use rayon::prelude::*;
 use xz2::read::XzDecoder;
 use xz2::stream::{Check, Filters, LzmaOptions, MatchFinder, Mode, Stream};
 use xz2::write::XzEncoder as XzWriterEncoder;
@@ -35,6 +37,85 @@ const ZBPS_FLAG_WIDE_OVERFITTING_CIRCUITS: u16 = 0x0002;
 const ZBPS_FLAG_SHARED_GROUPING_PAYLOAD: u16 = 0x0004;
 const MAX_HUFFMAN_CODE_BITS: u8 = 56;
 const ZBPK_MAX_OUTPUT_BYTES: usize = 1usize << 30; // 1 GiB hard safety bound
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CompressionProfile {
+    Fast,
+    Balanced,
+    Deep,
+    Research,
+}
+
+impl CompressionProfile {
+    fn from_env() -> Self {
+        let value = std::env::var("ZBIT_COMPRESSION_PROFILE")
+            .or_else(|_| std::env::var("ZBIT_PROFILE"))
+            .unwrap_or_else(|_| "balanced".to_string());
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Self::Fast,
+            "deep" => Self::Deep,
+            "research" => Self::Research,
+            _ => Self::Balanced,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Deep => "deep",
+            Self::Research => "research",
+        }
+    }
+
+    fn max_transform_plans(self) -> usize {
+        match self {
+            Self::Fast => 4,
+            Self::Balanced => 8,
+            Self::Deep => 12,
+            Self::Research => 16,
+        }
+    }
+
+    fn correction_transform_plan_budget(self) -> usize {
+        match self {
+            Self::Fast => 4,
+            Self::Balanced => 8,
+            Self::Deep => 12,
+            Self::Research => 16,
+        }
+    }
+
+    fn enable_xz_extreme_for_raw_xz(self) -> bool {
+        !matches!(self, Self::Fast)
+    }
+
+    fn enable_xz_extreme_refinement(self) -> bool {
+        !matches!(self, Self::Fast)
+    }
+
+    fn should_attempt_recursive_on_realtime_blocks(self) -> bool {
+        !matches!(self, Self::Fast)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CandidateTimingStats {
+    pub index_stream_ms: f64,
+    pub huffman_stream_ms: f64,
+    pub raw_deflate_ms: f64,
+    pub raw_zstd_ms: f64,
+    pub raw_xz_ms: f64,
+    pub framed_extraction_ms: f64,
+    pub recursive_preflate_ms: f64,
+    pub recursive_transform_sampling_ms: f64,
+    pub recursive_transform_eval_ms: f64,
+    pub recursive_correction_modeling_ms: f64,
+    pub recursive_total_ms: f64,
+    pub candidate_validation_ms: f64,
+    pub stream_block_planning_ms: f64,
+    pub stream_global_payload_ms: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct PackStats {
@@ -63,6 +144,9 @@ pub struct PackStats {
     pub chosen_method: PackMethod,
     pub chosen_reason: String,
     pub circuit_rule_note: String,
+    pub active_profile: String,
+    pub skipped_candidates: Vec<String>,
+    pub timings: CandidateTimingStats,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +194,9 @@ pub struct StreamPackStats {
     pub effective_wide_overfitting_circuits: bool,
     pub adaptive_wide_promotion_used: bool,
     pub shared_grouping_payload_used: bool,
+    pub active_profile: String,
+    pub skipped_candidates: Vec<String>,
+    pub timings: CandidateTimingStats,
 }
 
 #[derive(Debug, Clone)]
@@ -853,24 +940,34 @@ fn decode_raw_zstd_payload(payload: &[u8], original_size: usize) -> ZbitResult<V
     Ok(out)
 }
 
-fn build_raw_xz_payload(input: &[u8]) -> ZbitResult<Vec<u8>> {
-    let mut best: Option<Vec<u8>> = None;
-
-    for candidate in [
-        xz_encode_easy_preset(input, 9)?,
-        xz_encode_with_profile(input, 9, 3)?,
-        xz_encode_with_profile(input, 9, 4)?,
-        xz_encode_easy_preset(input, (1u32 << 31) | 9)?,
-        xz_encode_with_profile(input, (1u32 << 31) | 9, 3)?,
-        xz_encode_with_profile(input, (1u32 << 31) | 9, 4)?,
-    ] {
-        match &best {
-            Some(best_bytes) if best_bytes.len() <= candidate.len() => {}
-            _ => best = Some(candidate),
-        }
+fn build_raw_xz_payload(input: &[u8], profile: CompressionProfile) -> ZbitResult<Vec<u8>> {
+    let mut configs = vec![(0usize, 9u32, 0u32), (1, 9, 3), (2, 9, 4)];
+    if profile.enable_xz_extreme_for_raw_xz() {
+        let extreme = (1u32 << 31) | 9;
+        configs.extend([
+            (3usize, extreme, 0u32),
+            (4, extreme, 3u32),
+            (5, extreme, 4u32),
+        ]);
     }
 
-    best.ok_or_else(|| ZbitError::Internal("raw-xz candidate set is empty".to_string()))
+    let results = configs
+        .into_par_iter()
+        .map(|(rank, preset, profile_pb)| {
+            let payload = if profile_pb == 0 {
+                xz_encode_easy_preset(input, preset)?
+            } else {
+                xz_encode_with_profile(input, preset, profile_pb)?
+            };
+            Ok::<_, ZbitError>((rank, payload))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?;
+
+    let (_, best) = results
+        .into_iter()
+        .min_by_key(|(rank, payload)| (payload.len(), *rank))
+        .ok_or_else(|| ZbitError::Internal("raw-xz candidate set is empty".to_string()))?;
+    Ok(best)
 }
 
 fn decode_raw_xz_payload(payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
@@ -1159,7 +1256,10 @@ fn write_monotonic_delta_dictionary(out: &mut Vec<u8>, stream: &MonotonicDeltaSt
     push_u64(out, stream.transformed_plain_len as u64);
 }
 
-fn build_monotonic_delta_stream(input: &[u8]) -> ZbitResult<Option<MonotonicDeltaStream>> {
+fn build_monotonic_delta_stream(
+    input: &[u8],
+    profile: CompressionProfile,
+) -> ZbitResult<Option<MonotonicDeltaStream>> {
     let candidate_widths = [3usize, 4, 2, 5, 6, 7, 8, 1];
     let mut best: Option<(MonotonicDeltaStream, usize)> = None;
 
@@ -1216,7 +1316,7 @@ fn build_monotonic_delta_stream(input: &[u8]) -> ZbitResult<Option<MonotonicDelt
         }
 
         for (mode, transformed) in mode_candidates {
-            let (codec, payload) = choose_best_codec(&transformed, true, true)?;
+            let (codec, payload) = choose_best_codec(&transformed, true, true, profile)?;
             let shift = match mode {
                 MonotonicDeltaMode::GapTrailingZeroBytes
                 | MonotonicDeltaMode::GapTrailingZeroVarint => trailing_zero_shift,
@@ -2256,48 +2356,51 @@ fn choose_best_codec(
     data: &[u8],
     allow_raw: bool,
     allow_xz_extreme: bool,
+    profile: CompressionProfile,
 ) -> ZbitResult<(PayloadCodec, Vec<u8>)> {
-    let mut best_codec = PayloadCodec::Raw;
-    let mut best_bytes = if allow_raw { data.to_vec() } else { Vec::new() };
-    let mut best_len = if allow_raw {
-        best_bytes.len()
-    } else {
-        usize::MAX
+    let mut codec_jobs = vec![
+        (0usize, PayloadCodec::Xz, 9u32, 0u32),
+        (1usize, PayloadCodec::Xz, 9u32, 3u32),
+        (2usize, PayloadCodec::Xz, 9u32, 4u32),
+    ];
+    if allow_xz_extreme && profile.enable_xz_extreme_refinement() {
+        let extreme = (1u32 << 31) | 9;
+        codec_jobs.extend([
+            (3usize, PayloadCodec::XzExtreme, extreme, 0u32),
+            (4usize, PayloadCodec::XzExtreme, extreme, 3u32),
+            (5usize, PayloadCodec::XzExtreme, extreme, 4u32),
+        ]);
+    }
+
+    let mut candidates = codec_jobs
+        .into_par_iter()
+        .map(|(rank, codec, preset, profile_pb)| {
+            let payload = if profile_pb == 0 {
+                xz_encode_easy_preset(data, preset)?
+            } else {
+                xz_encode_with_profile(data, preset, profile_pb)?
+            };
+            Ok::<_, ZbitError>((rank, codec, payload))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?;
+
+    let zstd_level = match profile {
+        CompressionProfile::Fast => 10,
+        CompressionProfile::Balanced => 17,
+        CompressionProfile::Deep | CompressionProfile::Research => 19,
     };
+    let zstd = zstd_encode_with_level(data, zstd_level)?;
+    candidates.push((10usize, PayloadCodec::Zstd, zstd));
 
-    for xz in [
-        xz_encode_easy_preset(data, 9)?,
-        xz_encode_with_profile(data, 9, 3)?,
-        xz_encode_with_profile(data, 9, 4)?,
-    ] {
-        if xz.len() < best_len {
-            best_len = xz.len();
-            best_codec = PayloadCodec::Xz;
-            best_bytes = xz;
-        }
+    if allow_raw {
+        candidates.push((11usize, PayloadCodec::Raw, data.to_vec()));
     }
 
-    if allow_xz_extreme {
-        for xz_extreme in [
-            xz_encode_easy_preset(data, (1u32 << 31) | 9)?,
-            xz_encode_with_profile(data, (1u32 << 31) | 9, 3)?,
-            xz_encode_with_profile(data, (1u32 << 31) | 9, 4)?,
-        ] {
-            if xz_extreme.len() < best_len {
-                best_len = xz_extreme.len();
-                best_codec = PayloadCodec::XzExtreme;
-                best_bytes = xz_extreme;
-            }
-        }
-    }
-
-    let zstd = zstd_encode_with_level(data, 19)?;
-    if zstd.len() < best_len {
-        best_codec = PayloadCodec::Zstd;
-        best_bytes = zstd;
-    }
-
-    Ok((best_codec, best_bytes))
+    let (_, codec, payload) = candidates
+        .into_iter()
+        .min_by_key(|(rank, _, payload)| (payload.len(), *rank))
+        .ok_or_else(|| ZbitError::Internal("codec candidate set is empty".to_string()))?;
+    Ok((codec, payload))
 }
 
 fn score_periodic_candidates(data: &[u8], max_period: usize, top_k: usize) -> Vec<usize> {
@@ -2562,14 +2665,21 @@ fn build_topology_for_plan(plan: &CircuitTransformPlan) -> ZbitResult<Vec<Circui
     Ok(nodes)
 }
 
+#[derive(Debug, Clone)]
+struct AdaptiveTransformResult {
+    plan: CircuitTransformPlan,
+    topology: Vec<CircuitTopologyNode>,
+    codec: PayloadCodec,
+    payload: Vec<u8>,
+    sampling_ms: f64,
+    eval_ms: f64,
+}
+
 fn choose_adaptive_transform_plan(
     data: &[u8],
-) -> ZbitResult<(
-    CircuitTransformPlan,
-    Vec<CircuitTopologyNode>,
-    PayloadCodec,
-    Vec<u8>,
-)> {
+    profile: CompressionProfile,
+    selected_budget: usize,
+) -> ZbitResult<AdaptiveTransformResult> {
     let mut plans = vec![
         CircuitTransformPlan {
             kind: CircuitTransformKind::Identity,
@@ -2728,18 +2838,35 @@ fn choose_adaptive_transform_plan(
     let sample_len = data.len().min(512 * 1024);
     let sample = &data[..sample_len];
 
-    let mut scored = Vec::<(CircuitTransformPlan, usize)>::new();
-    for plan in &plans {
-        let Some(transformed_sample) = apply_transform_plan(sample, &plan) else {
-            continue;
-        };
-        let quick = zstd_encode_with_level(&transformed_sample, 1)?.len();
-        scored.push((*plan, quick));
-    }
+    let sample_timer = Instant::now();
+    let quick_zstd_level = match profile {
+        CompressionProfile::Fast | CompressionProfile::Balanced => 1,
+        CompressionProfile::Deep => 3,
+        CompressionProfile::Research => 5,
+    };
+    let scored = plans
+        .par_iter()
+        .map(|plan| {
+            let Some(transformed_sample) = apply_transform_plan(sample, plan) else {
+                return Ok::<_, ZbitError>(None);
+            };
+            let quick = zstd_encode_with_level(&transformed_sample, quick_zstd_level)?.len();
+            Ok(Some((*plan, quick)))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let sampling_ms = sample_timer.elapsed().as_secs_f64() * 1000.0;
+
+    let mut scored = scored;
     scored.sort_unstable_by_key(|entry| entry.1);
     let mut selected = Vec::<CircuitTransformPlan>::new();
     let mut selected_set = HashSet::<CircuitTransformPlan>::new();
-    for (plan, _) in scored.iter().take(8) {
+    let bounded_budget = selected_budget
+        .max(1)
+        .min(profile.max_transform_plans().max(1));
+    for (plan, _) in scored.iter().take(bounded_budget) {
         if selected_set.insert(*plan) {
             selected.push(*plan);
         }
@@ -2823,66 +2950,101 @@ fn choose_adaptive_transform_plan(
         }
     }
 
-    let mut best: Option<(
-        CircuitTransformPlan,
-        Vec<CircuitTopologyNode>,
-        PayloadCodec,
-        Vec<u8>,
-        usize,
-    )> = None;
     let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
-    for plan in selected {
-        let Some(transformed) = apply_transform_plan(data, &plan) else {
-            continue;
-        };
-        let (codec, final_payload) = choose_best_codec(&transformed, true, false)?;
-        let size = final_payload.len();
-        if trace_recursive {
-            eprintln!(
-                "zbit-trace plan-candidate kind={} period={} head={} encoded={} codec={}",
-                plan.kind.name(),
-                plan.period,
-                plan.head,
-                size,
-                codec.name()
-            );
-        }
-        let topology = build_topology_for_plan(&plan)?;
-        match &best {
-            Some((_, _, _, _, best_size)) if *best_size <= size => {}
-            _ => best = Some((plan, topology, codec, final_payload, size)),
-        }
-    }
+    let eval_timer = Instant::now();
+    let eval_results = selected
+        .iter()
+        .copied()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(rank, plan)| {
+            let Some(transformed) = apply_transform_plan(data, &plan) else {
+                return Ok::<_, ZbitError>(None);
+            };
+            let (codec, final_payload) = choose_best_codec(&transformed, true, false, profile)?;
+            if trace_recursive {
+                eprintln!(
+                    "zbit-trace plan-candidate kind={} period={} head={} encoded={} codec={}",
+                    plan.kind.name(),
+                    plan.period,
+                    plan.head,
+                    final_payload.len(),
+                    codec.name()
+                );
+            }
+            Ok(Some((rank, plan, transformed, codec, final_payload)))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let eval_ms = eval_timer.elapsed().as_secs_f64() * 1000.0;
 
-    let (plan, topology, mut codec, mut encoded, _) = best.ok_or_else(|| {
-        ZbitError::Internal("failed to evaluate adaptive transform plans".to_string())
-    })?;
-    if let Some(transformed) = apply_transform_plan(data, &plan) {
-        for xz_extreme in [
-            xz_encode_easy_preset(&transformed, (1u32 << 31) | 9)?,
-            xz_encode_with_profile(&transformed, (1u32 << 31) | 9, 3)?,
-            xz_encode_with_profile(&transformed, (1u32 << 31) | 9, 4)?,
-        ] {
-            if xz_extreme.len() < encoded.len() {
+    let (_, plan, transformed, mut codec, mut encoded) = eval_results
+        .into_iter()
+        .min_by_key(|(rank, _, _, _, final_payload)| (final_payload.len(), *rank))
+        .ok_or_else(|| {
+            ZbitError::Internal("failed to evaluate adaptive transform plans".to_string())
+        })?;
+    let topology = build_topology_for_plan(&plan)?;
+
+    if profile.enable_xz_extreme_refinement() {
+        let extreme = (1u32 << 31) | 9;
+        let xz_extreme_candidates = [
+            (0usize, extreme, 0u32),
+            (1usize, extreme, 3u32),
+            (2usize, extreme, 4u32),
+        ]
+        .into_par_iter()
+        .map(|(rank, preset, pb)| {
+            let encoded = if pb == 0 {
+                xz_encode_easy_preset(&transformed, preset)?
+            } else {
+                xz_encode_with_profile(&transformed, preset, pb)?
+            };
+            Ok::<_, ZbitError>((rank, encoded))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?;
+        if let Some((_, better)) = xz_extreme_candidates
+            .into_iter()
+            .min_by_key(|(rank, bytes)| (bytes.len(), *rank))
+        {
+            if better.len() < encoded.len() {
                 codec = PayloadCodec::XzExtreme;
-                encoded = xz_extreme;
+                encoded = better;
             }
         }
     }
-    Ok((plan, topology, codec, encoded))
+
+    Ok(AdaptiveTransformResult {
+        plan,
+        topology,
+        codec,
+        payload: encoded,
+        sampling_ms,
+        eval_ms,
+    })
 }
 
 fn choose_correction_transform_plan(
     corrections: &[u8],
-) -> ZbitResult<(CircuitTransformPlan, PayloadCodec, Vec<u8>)> {
+    profile: CompressionProfile,
+) -> ZbitResult<(CircuitTransformPlan, PayloadCodec, Vec<u8>, f64, f64)> {
     let identity_plan = CircuitTransformPlan {
         kind: CircuitTransformKind::Identity,
         period: 0,
         head: 0,
     };
-    let (identity_codec, identity_payload) = choose_best_codec(corrections, true, true)?;
-    let (candidate_plan, _, candidate_codec, candidate_payload) =
-        choose_adaptive_transform_plan(corrections)?;
+    let (identity_codec, identity_payload) = choose_best_codec(corrections, true, true, profile)?;
+    let candidate = choose_adaptive_transform_plan(
+        corrections,
+        profile,
+        profile.correction_transform_plan_budget(),
+    )?;
+    let candidate_plan = candidate.plan;
+    let candidate_codec = candidate.codec;
+    let candidate_payload = candidate.payload;
 
     let candidate_total = candidate_payload.len()
         + if candidate_plan == identity_plan {
@@ -2892,16 +3054,27 @@ fn choose_correction_transform_plan(
         };
 
     if candidate_total < identity_payload.len() {
-        Ok((candidate_plan, candidate_codec, candidate_payload))
+        Ok((
+            candidate_plan,
+            candidate_codec,
+            candidate_payload,
+            candidate.sampling_ms,
+            candidate.eval_ms,
+        ))
     } else {
-        Ok((identity_plan, identity_codec, identity_payload))
+        Ok((identity_plan, identity_codec, identity_payload, 0.0, 0.0))
     }
 }
 
-fn preflate_chain_candidates() -> Vec<u32> {
-    const DEFAULT: [u32; 3] = [4096, 8192, 16384];
+fn preflate_chain_candidates(profile: CompressionProfile) -> Vec<u32> {
+    let default = match profile {
+        CompressionProfile::Fast => vec![4096u32],
+        CompressionProfile::Balanced => vec![4096u32, 8192, 16384],
+        CompressionProfile::Deep => vec![4096u32, 8192, 16384, 24576],
+        CompressionProfile::Research => vec![2048u32, 4096, 8192, 16384, 24576, 32768],
+    };
     let Some(raw) = std::env::var_os("ZBIT_PREFLATE_CHAIN_CANDIDATES") else {
-        return DEFAULT.to_vec();
+        return default;
     };
 
     let mut out = Vec::new();
@@ -2920,7 +3093,7 @@ fn preflate_chain_candidates() -> Vec<u32> {
     out.sort_unstable();
     out.dedup();
     if out.is_empty() {
-        DEFAULT.to_vec()
+        default
     } else {
         out
     }
@@ -2929,10 +3102,16 @@ fn preflate_chain_candidates() -> Vec<u32> {
 fn build_recursive_circuit_stream(
     _input: &[u8],
     base: &FramedPayloadRun,
+    profile: CompressionProfile,
+    timings: &mut CandidateTimingStats,
+    skipped_candidates: &mut Vec<String>,
 ) -> ZbitResult<Option<RecursiveCircuitStream>> {
     if base.payload.len() < 6 {
+        skipped_candidates
+            .push("recursive-circuit-xz skipped: framed payload smaller than 6 bytes".to_string());
         return Ok(None);
     }
+    let recursive_total_timer = Instant::now();
 
     let mut zlib_header = [0u8; 2];
     zlib_header.copy_from_slice(&base.payload[..2]);
@@ -2940,112 +3119,125 @@ fn build_recursive_circuit_stream(
     zlib_adler32.copy_from_slice(&base.payload[base.payload.len() - 4..]);
     let deflate_stream = &base.payload[2..base.payload.len() - 4];
 
-    let mut best_stream: Option<(RecursiveCircuitStream, usize)> = None;
-    let mut transformed_template: Option<(
-        CircuitTransformPlan,
-        Vec<CircuitTopologyNode>,
-        PayloadCodec,
-        Vec<u8>,
-        usize,
-    )> = None;
-    let mut plain_len = 0usize;
-    let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
+    let preflate_timer = Instant::now();
+    let mut preflate_results = preflate_chain_candidates(profile)
+        .into_par_iter()
+        .map(|max_chain_length| {
+            let mut config = PreflateConfig::default();
+            config.verify_compression = true;
+            config.plain_text_limit = ZBPK_MAX_OUTPUT_BYTES;
+            config.max_chain_length = max_chain_length;
 
-    for max_chain_length in preflate_chain_candidates() {
-        let mut config = PreflateConfig::default();
-        config.verify_compression = true;
-        config.plain_text_limit = ZBPK_MAX_OUTPUT_BYTES;
-        config.max_chain_length = max_chain_length;
-
-        let (chunk, plain) = match preflate_whole_deflate_stream(deflate_stream, &config) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if transformed_template.is_none() {
-            let plain_bytes = plain.text();
-            plain_len = plain_bytes.len();
-            let (transform_plan, topology, transformed_codec, transformed_payload) =
-                choose_adaptive_transform_plan(plain_bytes)?;
-            transformed_template = Some((
-                transform_plan,
-                topology,
-                transformed_codec,
-                transformed_payload,
-                plain_len,
-            ));
-        }
-
-        let (transform_plan, base_topology, transformed_codec, transformed_payload, plain_len_ref) =
-            transformed_template.as_ref().ok_or_else(|| {
-                ZbitError::Internal(
-                    "recursive-circuit-xz missing transformed template after preflate".to_string(),
-                )
-            })?;
-
-        let corrections = chunk.corrections;
-        let (correction_plan, correction_codec, corrections_payload) =
-            choose_correction_transform_plan(&corrections)?;
-
-        let mut topology = base_topology.clone();
-        let _ = embed_correction_plan_in_topology(&mut topology, &correction_plan)?;
-
-        let transformed_encoded_len = transformed_payload.len();
-        let correction_plain_len = corrections.len();
-        let correction_encoded_len = corrections_payload.len();
-
-        let stream = RecursiveCircuitStream {
-            base: base.clone(),
-            transformed_payload: transformed_payload.clone(),
-            corrections_payload,
-            plain_len: *plain_len_ref,
-            transformed_encoded_len,
-            correction_plain_len,
-            correction_encoded_len,
-            transformed_codec: *transformed_codec,
-            correction_codec,
-            zlib_header,
-            zlib_adler32,
-            transform_plan: *transform_plan,
-            topology,
-        };
-
-        let candidate_total = ZBPK_HEADER_BYTES
-            + recursive_circuit_dictionary_size(&stream)
-            + stream.transformed_encoded_len
-            + stream.correction_encoded_len;
-
-        if trace_recursive {
-            eprintln!(
-                "zbit-trace recursive chain={} plan={} period={} head={} transformed={}({}) corrections={}({}) corr-plain={} total={}",
+            let Ok((chunk, plain)) = preflate_whole_deflate_stream(deflate_stream, &config) else {
+                return Ok::<_, ZbitError>(None);
+            };
+            Ok(Some((
                 max_chain_length,
-                stream.transform_plan.kind.name(),
-                stream.transform_plan.period,
-                stream.transform_plan.head,
-                stream.transformed_encoded_len,
-                stream.transformed_codec.name(),
-                stream.correction_encoded_len,
-                stream.correction_codec.name(),
-                stream.correction_plain_len,
-                candidate_total,
-            );
-            eprintln!(
-                "zbit-trace recursive correction-plan={} period={} head={}",
-                correction_plan.kind.name(),
-                correction_plan.period,
-                correction_plan.head
-            );
-        }
-
-        match &best_stream {
-            Some((_, best_total)) if *best_total <= candidate_total => {}
-            _ => best_stream = Some((stream, candidate_total)),
-        }
+                chunk.corrections,
+                plain.text().to_vec(),
+            )))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    preflate_results.sort_unstable_by_key(|(max_chain_length, _, _)| *max_chain_length);
+    timings.recursive_preflate_ms += preflate_timer.elapsed().as_secs_f64() * 1000.0;
+    if preflate_results.is_empty() {
+        skipped_candidates.push(
+            "recursive-circuit-xz unavailable: preflate reconstruction failed for all chain candidates"
+                .to_string(),
+        );
+        timings.recursive_total_ms += recursive_total_timer.elapsed().as_secs_f64() * 1000.0;
+        return Ok(None);
     }
 
-    let Some((stream, _)) = best_stream else {
+    let plain_len = preflate_results[0].2.len();
+    let transformed_template = choose_adaptive_transform_plan(
+        &preflate_results[0].2,
+        profile,
+        profile.max_transform_plans(),
+    )?;
+    timings.recursive_transform_sampling_ms += transformed_template.sampling_ms;
+    timings.recursive_transform_eval_ms += transformed_template.eval_ms;
+
+    let correction_timer = Instant::now();
+    let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
+    let evaluated = preflate_results
+        .into_par_iter()
+        .map(|(max_chain_length, corrections, _)| {
+            let (
+                correction_plan,
+                correction_codec,
+                corrections_payload,
+                _correction_sample_ms,
+                _correction_eval_ms,
+            ) = choose_correction_transform_plan(&corrections, profile)?;
+
+            let mut topology = transformed_template.topology.clone();
+            let _ = embed_correction_plan_in_topology(&mut topology, &correction_plan)?;
+
+            let stream = RecursiveCircuitStream {
+                base: base.clone(),
+                transformed_payload: transformed_template.payload.clone(),
+                corrections_payload,
+                plain_len,
+                transformed_encoded_len: transformed_template.payload.len(),
+                correction_plain_len: corrections.len(),
+                correction_encoded_len: 0,
+                transformed_codec: transformed_template.codec,
+                correction_codec,
+                zlib_header,
+                zlib_adler32,
+                transform_plan: transformed_template.plan,
+                topology,
+            };
+            let correction_encoded_len = stream.corrections_payload.len();
+            let mut stream = stream;
+            stream.correction_encoded_len = correction_encoded_len;
+
+            let candidate_total = ZBPK_HEADER_BYTES
+                + recursive_circuit_dictionary_size(&stream)
+                + stream.transformed_encoded_len
+                + stream.correction_encoded_len;
+            if trace_recursive {
+                eprintln!(
+                    "zbit-trace recursive chain={} plan={} period={} head={} transformed={}({}) corrections={}({}) corr-plain={} total={}",
+                    max_chain_length,
+                    stream.transform_plan.kind.name(),
+                    stream.transform_plan.period,
+                    stream.transform_plan.head,
+                    stream.transformed_encoded_len,
+                    stream.transformed_codec.name(),
+                    stream.correction_encoded_len,
+                    stream.correction_codec.name(),
+                    stream.correction_plain_len,
+                    candidate_total,
+                );
+                eprintln!(
+                    "zbit-trace recursive correction-plan={} period={} head={}",
+                    correction_plan.kind.name(),
+                    correction_plan.period,
+                    correction_plan.head
+                );
+            }
+            Ok::<_, ZbitError>((max_chain_length, stream, candidate_total))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?;
+    timings.recursive_correction_modeling_ms += correction_timer.elapsed().as_secs_f64() * 1000.0;
+
+    let Some((_max_chain_length, stream, _)) = evaluated
+        .into_iter()
+        .min_by_key(|(max_chain_length, _, candidate_total)| (*candidate_total, *max_chain_length))
+    else {
+        skipped_candidates.push(
+            "recursive-circuit-xz unavailable: no valid correction model candidate".to_string(),
+        );
+        timings.recursive_total_ms += recursive_total_timer.elapsed().as_secs_f64() * 1000.0;
         return Ok(None);
     };
+
+    let trace_recursive = std::env::var_os("ZBIT_TRACE_RECURSIVE").is_some();
 
     if trace_recursive {
         eprintln!(
@@ -3060,7 +3252,7 @@ fn build_recursive_circuit_stream(
             plain_len,
         );
     }
-
+    timings.recursive_total_ms += recursive_total_timer.elapsed().as_secs_f64() * 1000.0;
     Ok(Some(stream))
 }
 
@@ -3603,29 +3795,67 @@ fn write_pack_bytes(
 }
 
 fn compress_adaptive_to_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, PackStats)> {
+    let profile = CompressionProfile::from_env();
+    let mut timings = CandidateTimingStats::default();
+    let mut skipped_candidates = Vec::<String>::new();
+
+    let index_timer = Instant::now();
     let stream = build_index_stream(input)?;
+    timings.index_stream_ms = index_timer.elapsed().as_secs_f64() * 1000.0;
 
     let raw_candidate_bytes = ZBPK_HEADER_BYTES + input.len();
     let indexed_raw_candidate_bytes =
         ZBPK_HEADER_BYTES + stream.unique_symbols.len() + stream.payload.len();
 
+    let huffman_timer = Instant::now();
     let huffman_stream = build_huffman_stream(input, &stream)?;
+    timings.huffman_stream_ms = huffman_timer.elapsed().as_secs_f64() * 1000.0;
     let indexed_huffman_candidate_bytes = huffman_stream
         .as_ref()
         .map(|hs| ZBPK_HEADER_BYTES + hs.symbols.len() * 2 + hs.payload.len());
+
+    let raw_deflate_timer = Instant::now();
     let raw_deflate_payload = build_raw_deflate_payload(input)?;
+    timings.raw_deflate_ms = raw_deflate_timer.elapsed().as_secs_f64() * 1000.0;
     let raw_deflate_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_deflate_payload.len());
+
+    let raw_zstd_timer = Instant::now();
     let raw_zstd_payload = build_raw_zstd_payload(input)?;
+    timings.raw_zstd_ms = raw_zstd_timer.elapsed().as_secs_f64() * 1000.0;
     let raw_zstd_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_zstd_payload.len());
-    let raw_xz_payload = build_raw_xz_payload(input)?;
+
+    let raw_xz_timer = Instant::now();
+    let raw_xz_payload = build_raw_xz_payload(input, profile)?;
+    timings.raw_xz_ms = raw_xz_timer.elapsed().as_secs_f64() * 1000.0;
     let raw_xz_candidate_bytes = Some(ZBPK_HEADER_BYTES + raw_xz_payload.len());
+
+    if !profile.enable_xz_extreme_for_raw_xz() {
+        skipped_candidates.push(format!(
+            "raw-xz extreme profiles skipped by '{}' profile",
+            profile.name()
+        ));
+    }
+
+    let framed_timer = Instant::now();
     let framed_run = build_framed_payload_run(input);
+    timings.framed_extraction_ms = framed_timer.elapsed().as_secs_f64() * 1000.0;
     let framed_raw_candidate_bytes = framed_run
         .as_ref()
         .map(|run| ZBPK_HEADER_BYTES + framed_dictionary_size(run) + run.payload.len());
     let recursive_stream = match framed_run.as_ref() {
-        Some(run) => build_recursive_circuit_stream(input, run)?,
-        None => None,
+        Some(run) => build_recursive_circuit_stream(
+            input,
+            run,
+            profile,
+            &mut timings,
+            &mut skipped_candidates,
+        )?,
+        None => {
+            skipped_candidates.push(
+                "recursive-circuit-xz skipped: framed payload analyzer unavailable".to_string(),
+            );
+            None
+        }
     };
     let recursive_circuit_xz_candidate_bytes = recursive_stream.as_ref().map(|recursive| {
         ZBPK_HEADER_BYTES
@@ -3633,7 +3863,7 @@ fn compress_adaptive_to_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, PackStats)> 
             + recursive.transformed_encoded_len
             + recursive.correction_encoded_len
     });
-    let monotonic_stream = build_monotonic_delta_stream(input)?;
+    let monotonic_stream = build_monotonic_delta_stream(input, profile)?;
     let monotonic_delta_candidate_bytes = monotonic_stream.as_ref().map(|stream| {
         ZBPK_HEADER_BYTES + monotonic_delta_dictionary_size(stream) + stream.payload.len()
     });
@@ -3654,6 +3884,9 @@ fn compress_adaptive_to_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, PackStats)> 
     eval.monotonic_delta_total_bytes = monotonic_delta_candidate_bytes;
 
     let (should_eval_circuit, circuit_rule_note) = should_evaluate_circuit(&eval);
+    if !should_eval_circuit {
+        skipped_candidates.push(format!("indexed-circuit skipped: {circuit_rule_note}"));
+    }
 
     let (circuit_blobs, circuit_dictionary_bytes, indexed_circuit_candidate_bytes) =
         if should_eval_circuit {
@@ -3744,6 +3977,9 @@ fn compress_adaptive_to_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, PackStats)> 
         chosen_method: eval.chosen_method,
         chosen_reason: eval.chosen_reason,
         circuit_rule_note,
+        active_profile: profile.name().to_string(),
+        skipped_candidates,
+        timings,
     };
 
     Ok((pack_bytes, stats))
@@ -4087,6 +4323,9 @@ fn split_stream_chunks(input: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
 fn compress_stream_realtime_pack_bytes(
     input: &[u8],
     allow_recursive_candidate: bool,
+    profile: CompressionProfile,
+    timings: &mut CandidateTimingStats,
+    skipped_candidates: &mut Vec<String>,
 ) -> ZbitResult<(Vec<u8>, PackMethod)> {
     let raw_deflate_payload = build_raw_deflate_payload(input)?;
     let raw_zstd_payload = build_raw_zstd_payload(input)?;
@@ -4166,8 +4405,17 @@ fn compress_stream_realtime_pack_bytes(
         )?;
         candidates.push((PackMethod::FramedRaw, framed_bytes));
 
-        if allow_recursive_candidate && input.len() >= (512 * 1024) {
-            if let Some(recursive_stream) = build_recursive_circuit_stream(input, &framed_run)? {
+        if allow_recursive_candidate
+            && profile.should_attempt_recursive_on_realtime_blocks()
+            && input.len() >= (512 * 1024)
+        {
+            if let Some(recursive_stream) = build_recursive_circuit_stream(
+                input,
+                &framed_run,
+                profile,
+                timings,
+                skipped_candidates,
+            )? {
                 let recursive_bytes = write_pack_bytes(
                     PackMethod::RecursiveCircuitXz,
                     input,
@@ -4182,12 +4430,22 @@ fn compress_stream_realtime_pack_bytes(
                     Some(&recursive_stream),
                     None,
                 )?;
+                let validation_timer = Instant::now();
                 if let Ok(decoded) = decompress_pack_bytes(&recursive_bytes) {
                     if decoded == input {
                         candidates.push((PackMethod::RecursiveCircuitXz, recursive_bytes));
                     }
                 }
+                timings.candidate_validation_ms +=
+                    validation_timer.elapsed().as_secs_f64() * 1000.0;
             }
+        } else if allow_recursive_candidate
+            && !profile.should_attempt_recursive_on_realtime_blocks()
+        {
+            skipped_candidates.push(format!(
+                "stream recursive realtime candidate skipped by '{}' profile",
+                profile.name()
+            ));
         }
     }
 
@@ -4199,7 +4457,12 @@ fn compress_stream_realtime_pack_bytes(
     Ok((bytes, method))
 }
 
-fn compress_stream_wide_overfit_pack_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, PackMethod)> {
+fn compress_stream_wide_overfit_pack_bytes(
+    input: &[u8],
+    profile: CompressionProfile,
+    timings: &mut CandidateTimingStats,
+    skipped_candidates: &mut Vec<String>,
+) -> ZbitResult<(Vec<u8>, PackMethod)> {
     let raw_deflate_payload = build_raw_deflate_payload(input)?;
     let raw_zstd_payload = build_raw_zstd_payload(input)?;
 
@@ -4276,7 +4539,13 @@ fn compress_stream_wide_overfit_pack_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>,
         )?;
         candidates.push((PackMethod::FramedRaw, framed_bytes));
 
-        if let Some(recursive_stream) = build_recursive_circuit_stream(input, &framed_run)? {
+        if let Some(recursive_stream) = build_recursive_circuit_stream(
+            input,
+            &framed_run,
+            profile,
+            timings,
+            skipped_candidates,
+        )? {
             let recursive_bytes = write_pack_bytes(
                 PackMethod::RecursiveCircuitXz,
                 input,
@@ -4291,11 +4560,13 @@ fn compress_stream_wide_overfit_pack_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>,
                 Some(&recursive_stream),
                 None,
             )?;
+            let validation_timer = Instant::now();
             if let Ok(decoded) = decompress_pack_bytes(&recursive_bytes) {
                 if decoded == input {
                     candidates.push((PackMethod::RecursiveCircuitXz, recursive_bytes));
                 }
             }
+            timings.candidate_validation_ms += validation_timer.elapsed().as_secs_f64() * 1000.0;
         }
     }
 
@@ -4310,9 +4581,18 @@ fn compress_stream_range_pack_bytes(
     input: &[u8],
     realtime_mode: bool,
     allow_recursive_candidate: bool,
+    profile: CompressionProfile,
+    timings: &mut CandidateTimingStats,
+    skipped_candidates: &mut Vec<String>,
 ) -> ZbitResult<(Vec<u8>, PackMethod)> {
     if realtime_mode {
-        compress_stream_realtime_pack_bytes(input, allow_recursive_candidate)
+        compress_stream_realtime_pack_bytes(
+            input,
+            allow_recursive_candidate,
+            profile,
+            timings,
+            skipped_candidates,
+        )
     } else {
         let (pack_bytes, stats) = compress_adaptive_to_bytes(input)?;
         Ok((pack_bytes, stats.chosen_method))
@@ -4325,6 +4605,9 @@ fn stream_pack_range_candidate(
     end: usize,
     realtime_mode: bool,
     enable_realtime_root_recursive_candidate: bool,
+    profile: CompressionProfile,
+    timings: &mut CandidateTimingStats,
+    skipped_candidates: &mut Vec<String>,
     cache: &mut HashMap<(usize, usize), PackedRangeCandidate>,
 ) -> ZbitResult<PackedRangeCandidate> {
     if let Some(cached) = cache.get(&(start, end)) {
@@ -4344,8 +4627,14 @@ fn stream_pack_range_candidate(
     let allow_recursive_candidate =
         enable_realtime_root_recursive_candidate && is_block_root && merged.len() >= (512 * 1024);
 
-    let (pack_bytes, method) =
-        compress_stream_range_pack_bytes(&merged, realtime_mode, allow_recursive_candidate)?;
+    let (pack_bytes, method) = compress_stream_range_pack_bytes(
+        &merged,
+        realtime_mode,
+        allow_recursive_candidate,
+        profile,
+        timings,
+        skipped_candidates,
+    )?;
     let candidate = PackedRangeCandidate {
         pack_bytes,
         method,
@@ -4464,6 +4753,9 @@ fn build_best_stream_node(
     max_group_pieces: usize,
     realtime_mode: bool,
     enable_realtime_root_recursive_candidate: bool,
+    profile: CompressionProfile,
+    timings: &mut CandidateTimingStats,
+    skipped_candidates: &mut Vec<String>,
     memo: &mut HashMap<(usize, usize, u8), StreamNode>,
     pack_cache: &mut HashMap<(usize, usize), PackedRangeCandidate>,
 ) -> ZbitResult<StreamNode> {
@@ -4485,6 +4777,9 @@ fn build_best_stream_node(
             end,
             realtime_mode,
             enable_realtime_root_recursive_candidate,
+            profile,
+            timings,
+            skipped_candidates,
             pack_cache,
         )?;
         let node = stream_piece_node(
@@ -4512,6 +4807,9 @@ fn build_best_stream_node(
             max_group_pieces,
             realtime_mode,
             enable_realtime_root_recursive_candidate,
+            profile,
+            timings,
+            skipped_candidates,
             memo,
             pack_cache,
         )?;
@@ -4523,6 +4821,9 @@ fn build_best_stream_node(
             max_group_pieces,
             realtime_mode,
             enable_realtime_root_recursive_candidate,
+            profile,
+            timings,
+            skipped_candidates,
             memo,
             pack_cache,
         )?;
@@ -4547,6 +4848,9 @@ fn build_best_stream_node(
             end,
             realtime_mode,
             enable_realtime_root_recursive_candidate,
+            profile,
+            timings,
+            skipped_candidates,
             pack_cache,
         )?;
         let grouped = stream_group_node(
@@ -4883,6 +5187,9 @@ fn compress_stream_to_bytes(
     options: &StreamPackOptions,
 ) -> ZbitResult<(Vec<u8>, StreamPackStats)> {
     validate_stream_options(options)?;
+    let profile = CompressionProfile::from_env();
+    let mut timings = CandidateTimingStats::default();
+    let mut skipped_candidates = Vec::<String>::new();
 
     let chunks = split_stream_chunks(input, options.chunk_size);
     let total_chunks = chunks.len();
@@ -4905,20 +5212,40 @@ fn compress_stream_to_bytes(
         && block_count > 1
         && input.len() >= (1024 * 1024)
     {
-        let (pack_bytes, _) = compress_stream_wide_overfit_pack_bytes(input)?;
+        let shared_timer = Instant::now();
+        let (pack_bytes, _) = compress_stream_wide_overfit_pack_bytes(
+            input,
+            profile,
+            &mut timings,
+            &mut skipped_candidates,
+        )?;
         match decompress_pack_bytes(&pack_bytes) {
             Ok(decoded) if decoded == input => {
                 flags |= ZBPS_FLAG_SHARED_GROUPING_PAYLOAD;
+                timings.stream_global_payload_ms += shared_timer.elapsed().as_secs_f64() * 1000.0;
                 Some(pack_bytes)
             }
-            _ => None,
+            _ => {
+                skipped_candidates.push(
+                    "shared grouping payload rejected: roundtrip validation failed".to_string(),
+                );
+                timings.stream_global_payload_ms += shared_timer.elapsed().as_secs_f64() * 1000.0;
+                None
+            }
         }
     } else {
         None
     };
 
     if options.wide_overfitting_circuits {
-        let (global_pack_bytes, global_method) = compress_stream_wide_overfit_pack_bytes(input)?;
+        let global_timer = Instant::now();
+        let (global_pack_bytes, global_method) = compress_stream_wide_overfit_pack_bytes(
+            input,
+            profile,
+            &mut timings,
+            &mut skipped_candidates,
+        )?;
+        timings.stream_global_payload_ms += global_timer.elapsed().as_secs_f64() * 1000.0;
         let mut out = Vec::with_capacity(
             ZBPS_HEADER_BYTES
                 .checked_add(4)
@@ -5059,6 +5386,9 @@ fn compress_stream_to_bytes(
             effective_wide_overfitting_circuits: true,
             adaptive_wide_promotion_used: false,
             shared_grouping_payload_used: false,
+            active_profile: profile.name().to_string(),
+            skipped_candidates,
+            timings,
         };
 
         return Ok((out, stats));
@@ -5114,8 +5444,18 @@ fn compress_stream_to_bytes(
     let mut counts = StreamNodeCounts::default();
     let mut grouping_hint_updates = 0usize;
     let mut history_method: Option<PackMethod> = None;
-    let enable_realtime_root_recursive_candidate =
-        options.realtime_mode && options.max_group_depth >= 2;
+    let enable_realtime_root_recursive_candidate = options.realtime_mode
+        && options.max_group_depth >= 2
+        && shared_grouping_payload_bytes.is_none();
+    if options.realtime_mode
+        && options.max_group_depth >= 2
+        && shared_grouping_payload_bytes.is_some()
+    {
+        skipped_candidates.push(
+            "local realtime recursive root candidates skipped: shared grouping payload is active"
+                .to_string(),
+        );
+    }
 
     for block_index in 0..block_count {
         let block_start = block_index * options.key_piece_interval;
@@ -5126,6 +5466,7 @@ fn compress_stream_to_bytes(
             .map(|chunk| chunk.len())
             .sum::<usize>();
 
+        let planning_timer = Instant::now();
         let mut memo = HashMap::new();
         let mut pack_cache = HashMap::new();
         let local_root = build_best_stream_node(
@@ -5136,9 +5477,13 @@ fn compress_stream_to_bytes(
             options.max_group_pieces,
             options.realtime_mode,
             enable_realtime_root_recursive_candidate,
+            profile,
+            &mut timings,
+            &mut skipped_candidates,
             &mut memo,
             &mut pack_cache,
         )?;
+        timings.stream_block_planning_ms += planning_timer.elapsed().as_secs_f64() * 1000.0;
         let block_offset = block_start
             .checked_mul(options.chunk_size)
             .ok_or_else(|| ZbitError::Limit("stream block offset overflow".to_string()))?;
@@ -5219,6 +5564,9 @@ fn compress_stream_to_bytes(
         effective_wide_overfitting_circuits: false,
         adaptive_wide_promotion_used: false,
         shared_grouping_payload_used: shared_grouping_payload_bytes.is_some(),
+        active_profile: profile.name().to_string(),
+        skipped_candidates,
+        timings,
     };
 
     Ok((out, stats))

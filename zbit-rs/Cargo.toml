@@ -25,3 +25,4 @@ zstd = "0.13"
 crc32fast = "1.5"
 preflate-rs = { path = "../vendor/preflate-rs" }
 xz2 = "0.1"
+rayon = "1.10"

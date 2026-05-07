@@ -1,11 +1,15 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-05-07 13:16:41
+Generated: 2026-05-07 18:49:41
 Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge.zbpk
 
+Active profile: balanced
 Selected method: recursive-circuit-xz
 Selection reason: recursive-circuit-xz improves size: 2969440 -> 2670718 bytes
 Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
+
+Skipped candidates:
+- indexed-circuit skipped: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
 
 Raw candidate size (bytes): 2969440
 Indexed-raw candidate size (bytes): 2969696
@@ -23,18 +27,32 @@ Compressed size (bytes): 2670718
 Compression ratio (compressed/original): 0.899412
 Space savings (%): 10.06
 
-Compression time (ms): 617251.656
-Decompression time (ms): 9464.538
-Compression throughput (MiB/s): 0.005
-Decompression throughput (MiB/s): 0.299
+Compression time (ms): 100856.977
+Decompression time (ms): 9604.561
+Compression throughput (MiB/s): 0.028
+Decompression throughput (MiB/s): 0.295
+
+Candidate timing breakdown (ms):
+- index stream build: 525.625
+- huffman stream build: 624.174
+- raw-deflate encode: 537.744
+- raw-zstd encode: 719.680
+- raw-xz encode: 875.265
+- framed extraction: 3976.563
+- recursive preflate search: 40855.428
+- recursive transform sampling: 847.324
+- recursive transform evaluation: 37518.271
+- recursive correction modeling: 7215.951
+- recursive total: 93206.106
+- candidate validation: 0.000
 
 Resource usage (KiB):
-- RSS before compression: 5636
-- RSS after compression: 82688
-- RSS after decompression: 83880
-- Compression RSS delta: 77052
-- Decompression RSS delta: 1192
-- Peak RSS (VmHWM): 220928
+- RSS before compression: 5788
+- RSS after compression: 501756
+- RSS after decompression: 518312
+- Compression RSS delta: 495968
+- Decompression RSS delta: 16556
+- Peak RSS (VmHWM): 3367984
 
 Unique symbols: 256
 Bits per symbol index: 0

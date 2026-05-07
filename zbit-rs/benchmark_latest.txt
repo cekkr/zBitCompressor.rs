@@ -1,11 +1,16 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-05-07 13:05:38
+Generated: 2026-05-07 18:47:47
 Input file: papers/zbit-algorithmsResearch.md
 Compressed artifact: zbit-rs/benchmark_algorithmsResearch.zbpk
 
+Active profile: balanced
 Selected method: raw-xz
 Selection reason: raw-xz improves size: 62051 -> 20632 bytes
 Circuit evaluation rule: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
+
+Skipped candidates:
+- recursive-circuit-xz skipped: framed payload analyzer unavailable
+- indexed-circuit skipped: symbol width <= 8 bits: raw dictionary is denser than circuit descriptors
 
 Raw candidate size (bytes): 62051
 Indexed-raw candidate size (bytes): 54414
@@ -23,18 +28,32 @@ Compressed size (bytes): 20632
 Compression ratio (compressed/original): 0.332694
 Space savings (%): 66.73
 
-Compression time (ms): 328.969
-Decompression time (ms): 1.102
-Compression throughput (MiB/s): 0.180
-Decompression throughput (MiB/s): 53.674
+Compression time (ms): 229.356
+Decompression time (ms): 1.215
+Compression throughput (MiB/s): 0.258
+Decompression throughput (MiB/s): 48.697
+
+Candidate timing breakdown (ms):
+- index stream build: 8.806
+- huffman stream build: 8.712
+- raw-deflate encode: 12.912
+- raw-zstd encode: 107.905
+- raw-xz encode: 81.452
+- framed extraction: 3.802
+- recursive preflate search: 0.000
+- recursive transform sampling: 0.000
+- recursive transform evaluation: 0.000
+- recursive correction modeling: 0.000
+- recursive total: 0.000
+- candidate validation: 0.000
 
 Resource usage (KiB):
-- RSS before compression: 2796
-- RSS after compression: 5516
-- RSS after decompression: 5540
-- Compression RSS delta: 2720
-- Decompression RSS delta: 24
-- Peak RSS (VmHWM): 87332
+- RSS before compression: 3012
+- RSS after compression: 7820
+- RSS after decompression: 7864
+- Compression RSS delta: 4808
+- Decompression RSS delta: 44
+- Peak RSS (VmHWM): 143612
 
 Unique symbols: 114
 Bits per symbol index: 0
