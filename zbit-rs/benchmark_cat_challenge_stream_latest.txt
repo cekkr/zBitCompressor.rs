@@ -1,5 +1,5 @@
 zBit-rs Stream Benchmark Report
-Generated: 2026-05-07 10:46:16
+Generated: 2026-05-07 11:04:04
 Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge_stream.zbps
 
@@ -23,14 +23,14 @@ Stream topology:
 - key-piece decode note: receiver can start from chunk indices that are multiples of 8 (block/key boundaries)
 
 Original size (bytes): 2969404
-Compressed size (bytes): 2969594
-Compression ratio (compressed/original): 1.000064
-Space savings (%): -0.01
+Compressed size (bytes): 2965318
+Compression ratio (compressed/original): 0.998624
+Space savings (%): 0.14
 
-Compression time (ms): 4240.523
-Decompression time (ms): 3.927
-Compression throughput (MiB/s): 0.668
-Decompression throughput (MiB/s): 721.088
+Compression time (ms): 6418.050
+Decompression time (ms): 8.215
+Compression throughput (MiB/s): 0.441
+Decompression throughput (MiB/s): 344.701
 
 Output validation: PASS
 Key-piece resume validation: PASS

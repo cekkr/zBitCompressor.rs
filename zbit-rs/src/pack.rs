@@ -4070,24 +4070,8 @@ fn split_stream_chunks(input: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
 }
 
 fn compress_stream_realtime_pack_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, PackMethod)> {
-    let raw_candidate_size = ZBPK_HEADER_BYTES + input.len();
     let raw_deflate_payload = build_raw_deflate_payload(input)?;
     let raw_zstd_payload = build_raw_zstd_payload(input)?;
-
-    let deflate_candidate_size = ZBPK_HEADER_BYTES + raw_deflate_payload.len();
-    let zstd_candidate_size = ZBPK_HEADER_BYTES + raw_zstd_payload.len();
-
-    let mut chosen_method = PackMethod::RawCopy;
-    let mut best_size = raw_candidate_size;
-    if deflate_candidate_size < best_size {
-        chosen_method = PackMethod::RawDeflate;
-        best_size = deflate_candidate_size;
-    }
-    if zstd_candidate_size < best_size {
-        chosen_method = PackMethod::RawZstd;
-        best_size = zstd_candidate_size;
-    }
-    let _ = best_size;
 
     let empty_stream = IndexStream {
         unique_symbols: Vec::new(),
@@ -4095,21 +4079,82 @@ fn compress_stream_realtime_pack_bytes(input: &[u8]) -> ZbitResult<(Vec<u8>, Pac
         payload: Vec::new(),
         frequencies: [0u32; 256],
     };
-    let pack_bytes = write_pack_bytes(
-        chosen_method,
+
+    let raw_copy_bytes = write_pack_bytes(
+        PackMethod::RawCopy,
+        input,
+        &empty_stream,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+
+    let raw_deflate_bytes = write_pack_bytes(
+        PackMethod::RawDeflate,
         input,
         &empty_stream,
         None,
         0,
         None,
         Some(raw_deflate_payload.as_slice()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+
+    let raw_zstd_bytes = write_pack_bytes(
+        PackMethod::RawZstd,
+        input,
+        &empty_stream,
+        None,
+        0,
+        None,
+        None,
         Some(raw_zstd_payload.as_slice()),
         None,
         None,
         None,
         None,
     )?;
-    Ok((pack_bytes, chosen_method))
+
+    let mut candidates = vec![
+        (PackMethod::RawCopy, raw_copy_bytes),
+        (PackMethod::RawDeflate, raw_deflate_bytes),
+        (PackMethod::RawZstd, raw_zstd_bytes),
+    ];
+
+    if let Some(framed_run) = build_framed_payload_run(input) {
+        let framed_bytes = write_pack_bytes(
+            PackMethod::FramedRaw,
+            input,
+            &empty_stream,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(&framed_run),
+            None,
+            None,
+        )?;
+        candidates.push((PackMethod::FramedRaw, framed_bytes));
+    }
+
+    candidates.sort_by_key(|(_, bytes)| bytes.len());
+    let (method, bytes) = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| ZbitError::Internal("missing stream realtime pack candidate".to_string()))?;
+    Ok((bytes, method))
 }
 
 fn compress_stream_range_pack_bytes(
