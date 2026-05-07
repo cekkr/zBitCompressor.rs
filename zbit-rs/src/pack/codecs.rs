@@ -52,33 +52,10 @@ fn decode_raw_zstd_payload(payload: &[u8], original_size: usize) -> ZbitResult<V
 }
 
 fn build_raw_xz_payload(input: &[u8], profile: CompressionProfile) -> ZbitResult<Vec<u8>> {
-    let mut configs = vec![(0usize, 9u32, 0u32), (1, 9, 3), (2, 9, 4)];
-    if profile.enable_xz_extreme_for_raw_xz() {
-        let extreme = (1u32 << 31) | 9;
-        configs.extend([
-            (3usize, extreme, 0u32),
-            (4, extreme, 3u32),
-            (5, extreme, 4u32),
-        ]);
-    }
-
-    let results = configs
-        .into_par_iter()
-        .map(|(rank, preset, profile_pb)| {
-            let payload = if profile_pb == 0 {
-                xz_encode_easy_preset(input, preset)?
-            } else {
-                xz_encode_with_profile(input, preset, profile_pb)?
-            };
-            Ok::<_, ZbitError>((rank, payload))
-        })
-        .collect::<ZbitResult<Vec<_>>>()?;
-
-    let (_, best) = results
-        .into_iter()
-        .min_by_key(|(rank, payload)| (payload.len(), *rank))
+    let allow_xz_extreme = profile.enable_xz_extreme_for_raw_xz();
+    let (_, payload) = choose_best_tuned_xz_candidate(input, profile, allow_xz_extreme)?
         .ok_or_else(|| ZbitError::Internal("raw-xz candidate set is empty".to_string()))?;
-    Ok(best)
+    Ok(payload)
 }
 
 fn decode_raw_xz_payload(payload: &[u8], original_size: usize) -> ZbitResult<Vec<u8>> {
@@ -507,21 +484,47 @@ fn xz_encode_easy_preset(data: &[u8], preset: u32) -> ZbitResult<Vec<u8>> {
         .map_err(|e| ZbitError::Io(format!("xz easy encode finish failed: {e}")))
 }
 
-fn xz_encode_with_profile(
+#[derive(Clone, Copy)]
+struct XzTuningParams {
+    literal_context_bits: u32,
+    literal_position_bits: u32,
+    position_bits: u32,
+    dict_size: u32,
+    nice_len: u32,
+    match_finder: MatchFinder,
+    mode: Mode,
+    depth: u32,
+}
+
+#[derive(Clone, Copy)]
+enum XzCandidateKind {
+    Easy,
+    Tuned(XzTuningParams),
+}
+
+#[derive(Clone, Copy)]
+struct XzCodecCandidate {
+    rank: usize,
+    codec: PayloadCodec,
+    preset: u32,
+    kind: XzCandidateKind,
+}
+
+fn xz_encode_with_tuning(
     data: &[u8],
     preset: u32,
-    literal_context_bits: u32,
+    tuning: XzTuningParams,
 ) -> ZbitResult<Vec<u8>> {
     let mut options = LzmaOptions::new_preset(preset)
         .map_err(|e| ZbitError::Io(format!("xz options preset init failed: {e}")))?;
-    options.dict_size(64 * 1024 * 1024);
-    options.literal_context_bits(literal_context_bits);
-    options.literal_position_bits(0);
-    options.position_bits(2);
-    options.mode(Mode::Normal);
-    options.nice_len(273);
-    options.match_finder(MatchFinder::BinaryTree4);
-    options.depth(0);
+    options.dict_size(tuning.dict_size);
+    options.literal_context_bits(tuning.literal_context_bits);
+    options.literal_position_bits(tuning.literal_position_bits);
+    options.position_bits(tuning.position_bits);
+    options.mode(tuning.mode);
+    options.nice_len(tuning.nice_len);
+    options.match_finder(tuning.match_finder);
+    options.depth(tuning.depth);
 
     let mut filters = Filters::new();
     filters.lzma2(&options);
@@ -536,6 +539,302 @@ fn xz_encode_with_profile(
     encoder
         .finish()
         .map_err(|e| ZbitError::Io(format!("xz encode finish failed: {e}")))
+}
+
+fn xz_encode_with_profile(
+    data: &[u8],
+    preset: u32,
+    literal_context_bits: u32,
+) -> ZbitResult<Vec<u8>> {
+    xz_encode_with_tuning(
+        data,
+        preset,
+        XzTuningParams {
+            literal_context_bits,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+    )
+}
+
+fn tuned_xz_param_matrix() -> Vec<XzTuningParams> {
+    vec![
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 0,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 1,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 3,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 4,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 4,
+            literal_position_bits: 0,
+            position_bits: 0,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 2,
+            literal_position_bits: 2,
+            position_bits: 0,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 1,
+            position_bits: 0,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 1,
+            position_bits: 1,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 32 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 16 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 8 * 1024 * 1024,
+            nice_len: 273,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 192,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 64 * 1024 * 1024,
+            nice_len: 128,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 0,
+            dict_size: 32 * 1024 * 1024,
+            nice_len: 192,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 2,
+            literal_position_bits: 2,
+            position_bits: 0,
+            dict_size: 32 * 1024 * 1024,
+            nice_len: 192,
+            match_finder: MatchFinder::BinaryTree4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 32 * 1024 * 1024,
+            nice_len: 192,
+            match_finder: MatchFinder::HashChain4,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+        XzTuningParams {
+            literal_context_bits: 3,
+            literal_position_bits: 0,
+            position_bits: 2,
+            dict_size: 32 * 1024 * 1024,
+            nice_len: 192,
+            match_finder: MatchFinder::BinaryTree3,
+            mode: Mode::Normal,
+            depth: 0,
+        },
+    ]
+}
+
+fn tuned_xz_budget(profile: CompressionProfile) -> (usize, usize) {
+    match profile {
+        CompressionProfile::Fast => (3, 0),
+        CompressionProfile::Balanced => (10, 6),
+        CompressionProfile::Deep => (14, 10),
+        CompressionProfile::Research => (18, 14),
+    }
+}
+
+fn build_tuned_xz_candidates(
+    profile: CompressionProfile,
+    allow_xz_extreme: bool,
+) -> Vec<XzCodecCandidate> {
+    let (normal_budget, extreme_budget) = tuned_xz_budget(profile);
+    let tuning = tuned_xz_param_matrix();
+
+    let mut out = Vec::new();
+    let mut rank = 0usize;
+
+    out.push(XzCodecCandidate {
+        rank,
+        codec: PayloadCodec::Xz,
+        preset: 9u32,
+        kind: XzCandidateKind::Easy,
+    });
+    rank += 1;
+
+    for params in tuning.iter().copied().take(normal_budget) {
+        out.push(XzCodecCandidate {
+            rank,
+            codec: PayloadCodec::Xz,
+            preset: 9u32,
+            kind: XzCandidateKind::Tuned(params),
+        });
+        rank += 1;
+    }
+
+    if allow_xz_extreme {
+        let extreme = (1u32 << 31) | 9u32;
+        out.push(XzCodecCandidate {
+            rank,
+            codec: PayloadCodec::XzExtreme,
+            preset: extreme,
+            kind: XzCandidateKind::Easy,
+        });
+        rank += 1;
+
+        for params in tuning.iter().copied().take(extreme_budget) {
+            out.push(XzCodecCandidate {
+                rank,
+                codec: PayloadCodec::XzExtreme,
+                preset: extreme,
+                kind: XzCandidateKind::Tuned(params),
+            });
+            rank += 1;
+        }
+    }
+
+    out
+}
+
+fn choose_best_tuned_xz_candidate(
+    data: &[u8],
+    profile: CompressionProfile,
+    allow_xz_extreme: bool,
+) -> ZbitResult<Option<(PayloadCodec, Vec<u8>)>> {
+    let candidates = build_tuned_xz_candidates(profile, allow_xz_extreme);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let best = candidates
+        .into_par_iter()
+        .map(|candidate| {
+            let payload = match candidate.kind {
+                XzCandidateKind::Easy => xz_encode_easy_preset(data, candidate.preset)?,
+                XzCandidateKind::Tuned(params) => {
+                    xz_encode_with_tuning(data, candidate.preset, params)?
+                }
+            };
+            Ok::<_, ZbitError>((candidate.rank, candidate.codec, payload))
+        })
+        .collect::<ZbitResult<Vec<_>>>()?
+        .into_iter()
+        .min_by_key(|(rank, _, payload)| (payload.len(), *rank))
+        .map(|(_, codec, payload)| (codec, payload));
+
+    Ok(best)
 }
 
 fn xz_decode_all(data: &[u8]) -> ZbitResult<Vec<u8>> {
@@ -667,4 +966,3 @@ fn choose_best_codec_cached(
         .insert(key, (codec, payload.clone()));
     Ok((codec, payload))
 }
-

@@ -114,7 +114,7 @@ Implemented:
 
 Code:
 
-- `zbit-rs/src/pack.rs`
+- `zbit-rs/src/pack/`
 - `zbit-rs/src/pack_rules.rs`
 
 ### 7. Streaming compression with multi-level grouping
@@ -129,7 +129,7 @@ Implemented:
 
 Code:
 
-- `zbit-rs/src/pack.rs`
+- `zbit-rs/src/pack/`
 - `zbit-rs/src/bin/benchmark_stream_real_file.rs`
 
 ### 8. Validation and benchmark as first-class workflow
@@ -165,7 +165,7 @@ Inside `zbit-rs/`:
 - `src/minimizer.rs`: exact minimization engine
 - `src/advanced.rs`: heuristic/rewrite/SAT/objective optimization flow
 - `src/sat.rs`: internal SAT solver used by local exactness pruning
-- `src/pack.rs`: adaptive `.zbpk` + streaming `.zbps` compression/decompression
+- `src/pack/`: adaptive `.zbpk` + streaming `.zbps` compression/decompression
 - `src/pack_rules.rs`: method-selection rules
 - `src/bin/benchmark_real_file.rs`: real-file benchmark binary
 - `src/bin/benchmark_stream_real_file.rs`: real-file stream benchmark binary
@@ -236,7 +236,7 @@ Current snapshot (reports generated on 2026-05-07):
 
 | Test | Input | Selected method/profile | Original -> Compressed (bytes) | Ratio | Savings | Compression ms | Decompression ms | Peak RSS KiB | Validation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `221.608` | `1.119` | `145936` | `PASS` |
+| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20580` | `0.331855` | `66.81%` | `313.161` | `1.134` | `409420` | `PASS` |
 | Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `16634.566` | `151.082` | `588248` | `PASS` |
 | Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `112499.682` | `9637.900` | `3410588` | `PASS` |
 | Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `115086.113` | `9613.753` | `3357636` | `PASS` |

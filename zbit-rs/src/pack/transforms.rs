@@ -1210,31 +1210,14 @@ fn choose_adaptive_transform_plan(
         })?;
     let topology = build_topology_for_plan(&plan)?;
 
-    if profile.enable_xz_extreme_refinement() {
-        let extreme = (1u32 << 31) | 9;
-        let xz_extreme_candidates = [
-            (0usize, extreme, 0u32),
-            (1usize, extreme, 3u32),
-            (2usize, extreme, 4u32),
-        ]
-        .into_par_iter()
-        .map(|(rank, preset, pb)| {
-            let encoded = if pb == 0 {
-                xz_encode_easy_preset(&transformed, preset)?
-            } else {
-                xz_encode_with_profile(&transformed, preset, pb)?
-            };
-            Ok::<_, ZbitError>((rank, encoded))
-        })
-        .collect::<ZbitResult<Vec<_>>>()?;
-        if let Some((_, better)) = xz_extreme_candidates
-            .into_iter()
-            .min_by_key(|(rank, bytes)| (bytes.len(), *rank))
-        {
-            if better.len() < encoded.len() {
-                codec = PayloadCodec::XzExtreme;
-                encoded = better;
-            }
+    if let Some((candidate_codec, candidate_payload)) = choose_best_tuned_xz_candidate(
+        &transformed,
+        profile,
+        profile.enable_xz_extreme_refinement(),
+    )? {
+        if candidate_payload.len() < encoded.len() {
+            codec = candidate_codec;
+            encoded = candidate_payload;
         }
     }
 
@@ -1286,4 +1269,3 @@ fn choose_correction_transform_plan(
         Ok((identity_plan, identity_codec, identity_payload, 0.0, 0.0))
     }
 }
-
