@@ -125,6 +125,7 @@ Implemented:
 - per-chunk/per-group adaptive selection with configurable multi-level grouping depth
 - deterministic block boundaries so receivers can start decode from key pieces without replaying full history
 - optional grouping-history hints in block headers for sharing generalized grouping strategy over time
+- optional shared-grouping payload layer in non-wide realtime mode, so blocks can reference global generalized circuits/slices when local piece compression is weaker
 
 Code:
 
@@ -235,16 +236,16 @@ Current snapshot (reports generated on 2026-05-07):
 | Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `328.969` | `1.102` | `87332` | `PASS` |
 | Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `28383.045` | `148.948` | `126184` | `PASS` |
 | Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `617251.656` | `9464.538` | `220928` | `PASS` |
-| Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `618791.973` | `9570.839` | `227120` | `PASS` |
+| Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `621159.756` | `9480.250` | `226544` | `PASS` |
 
 ### Latest Cat Stream Multilevel Profiles
 
 | Profile | Ratio | Savings | Original -> Compressed (bytes) | Compression ms | Decompression ms | Compression MiB/s | Decompression MiB/s | Compression RSS delta KiB | Decompression RSS delta KiB | Peak RSS KiB | Validation | Resume |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `realtime-fast` | `0.999011` | `0.10%` | `2969404 -> 2966468` | `5967.794` | `10.306` | `0.475` | `274.788` | `5304` | `5016` | `97464` | `PASS` | `PASS` |
-| `realtime-balanced` | `0.998624` | `0.14%` | `2969404 -> 2965318` | `6425.017` | `8.475` | `0.441` | `334.128` | `46188` | `0` | `150832` | `PASS` | `PASS` |
-| `realtime-deep` | `0.998624` | `0.14%` | `2969404 -> 2965318` | `8565.166` | `8.233` | `0.331` | `343.970` | `48568` | `0` | `174632` | `PASS` | `PASS` |
-| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `615185.297` | `9538.138` | `0.005` | `0.297` | `74784` | `12` | `226100` | `PASS` | `PASS` |
+| `realtime-fast` | `0.899597` | `10.04%` | `2969404 -> 2671266` | `649139.666` | `9483.398` | `0.004` | `0.299` | `77584` | `0` | `226916` | `PASS` | `PASS` |
+| `realtime-balanced` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `1079593.691` | `9474.312` | `0.003` | `0.299` | `123164` | `0` | `233564` | `PASS` | `PASS` |
+| `realtime-deep` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `1054402.704` | `9461.109` | `0.003` | `0.299` | `143916` | `0` | `256076` | `PASS` | `PASS` |
+| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `622578.055` | `9486.900` | `0.005` | `0.299` | `74640` | `0` | `226752` | `PASS` | `PASS` |
 
 Latest outputs for the tracked tests are written to:
 

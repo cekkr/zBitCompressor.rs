@@ -224,7 +224,10 @@ Streaming settings:\n\
 - max group pieces: {max_group_pieces}\n\
 - carry grouping history: {carry_grouping_history}\n\
 - realtime mode: {realtime_mode}\n\
-- wide overfitting circuits: {wide_overfitting_circuits}\n\
+- requested wide overfitting circuits: {wide_overfitting_circuits}\n\
+- effective wide overfitting circuits: {effective_wide_overfitting_circuits}\n\
+- adaptive wide promotion used: {adaptive_wide_promotion_used}\n\
+- shared grouping payload used: {shared_grouping_payload_used}\n\
 \n\
 Stream topology:\n\
 - total chunks: {total_chunks}\n\
@@ -264,6 +267,9 @@ Key-piece resume validation: {key_resume}\n",
         carry_grouping_history = options.carry_grouping_history,
         realtime_mode = options.realtime_mode,
         wide_overfitting_circuits = options.wide_overfitting_circuits,
+        effective_wide_overfitting_circuits = stats.effective_wide_overfitting_circuits,
+        adaptive_wide_promotion_used = stats.adaptive_wide_promotion_used,
+        shared_grouping_payload_used = stats.shared_grouping_payload_used,
         total_chunks = stats.total_chunks,
         key_pieces = stats.key_piece_count,
         block_count = stats.block_count,
@@ -301,13 +307,16 @@ Key-piece resume validation: {key_resume}\n",
     println!("compressed artifact: {pack_path}");
     println!("report file: {report_path}");
     println!(
-        "stream settings: chunk={} bytes key_interval={} max_depth={} max_group_pieces={} realtime={} wide_overfit={} carry_history={}",
+        "stream settings: chunk={} bytes key_interval={} max_depth={} max_group_pieces={} realtime={} requested_wide_overfit={} effective_wide_overfit={} promotion_used={} shared_payload={} carry_history={}",
         stats.chunk_size,
         stats.key_piece_interval,
         stats.max_group_depth,
         stats.max_group_pieces,
         options.realtime_mode,
         options.wide_overfitting_circuits,
+        stats.effective_wide_overfitting_circuits,
+        stats.adaptive_wide_promotion_used,
+        stats.shared_grouping_payload_used,
         options.carry_grouping_history
     );
     println!("original bytes: {}", stats.original_size);

@@ -1,5 +1,5 @@
 zBit-rs Stream Benchmark Report
-Generated: 2026-05-07 13:27:23
+Generated: 2026-05-07 17:13:50
 Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge_stream.zbps
 
@@ -10,7 +10,10 @@ Streaming settings:
 - max group pieces: 8
 - carry grouping history: true
 - realtime mode: true
-- wide overfitting circuits: true
+- requested wide overfitting circuits: true
+- effective wide overfitting circuits: true
+- adaptive wide promotion used: false
+- shared grouping payload used: false
 
 Stream topology:
 - total chunks: 12
@@ -28,18 +31,18 @@ Compressed size (bytes): 2670846
 Compression ratio (compressed/original): 0.899455
 Space savings (%): 10.05
 
-Compression time (ms): 618791.973
-Decompression time (ms): 9570.839
+Compression time (ms): 621159.756
+Decompression time (ms): 9480.250
 Compression throughput (MiB/s): 0.005
-Decompression throughput (MiB/s): 0.296
+Decompression throughput (MiB/s): 0.299
 
 Resource usage (KiB):
-- RSS before compression: 5576
-- RSS after compression: 80948
-- RSS after decompression: 80948
-- Compression RSS delta: 75372
+- RSS before compression: 5588
+- RSS after compression: 80312
+- RSS after decompression: 80312
+- Compression RSS delta: 74724
 - Decompression RSS delta: 0
-- Peak RSS (VmHWM): 227120
+- Peak RSS (VmHWM): 226544
 
 Output validation: PASS
 Key-piece resume validation: PASS
