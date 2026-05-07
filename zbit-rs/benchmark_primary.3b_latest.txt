@@ -1,5 +1,5 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-05-07 18:47:42
+Generated: 2026-05-07 19:14:25
 Input file: assets/primary.3b.bin
 Compressed artifact: zbit-rs/benchmark_primary.3b.zbpk
 
@@ -28,18 +28,18 @@ Compressed size (bytes): 562836
 Compression ratio (compressed/original): 0.174058
 Space savings (%): 82.59
 
-Compression time (ms): 16414.882
-Decompression time (ms): 145.228
-Compression throughput (MiB/s): 0.188
-Decompression throughput (MiB/s): 21.234
+Compression time (ms): 16634.566
+Decompression time (ms): 151.082
+Compression throughput (MiB/s): 0.185
+Decompression throughput (MiB/s): 20.411
 
 Candidate timing breakdown (ms):
-- index stream build: 507.329
-- huffman stream build: 652.694
-- raw-deflate encode: 664.843
-- raw-zstd encode: 1008.214
-- raw-xz encode: 808.285
-- framed extraction: 7445.105
+- index stream build: 492.771
+- huffman stream build: 669.643
+- raw-deflate encode: 666.639
+- raw-zstd encode: 990.809
+- raw-xz encode: 819.695
+- framed extraction: 7593.273
 - recursive preflate search: 0.000
 - recursive transform sampling: 0.000
 - recursive transform evaluation: 0.000
@@ -48,12 +48,12 @@ Candidate timing breakdown (ms):
 - candidate validation: 0.000
 
 Resource usage (KiB):
-- RSS before compression: 6044
-- RSS after compression: 19876
-- RSS after decompression: 22516
-- Compression RSS delta: 13832
-- Decompression RSS delta: 2640
-- Peak RSS (VmHWM): 589884
+- RSS before compression: 6112
+- RSS after compression: 20332
+- RSS after decompression: 22668
+- Compression RSS delta: 14220
+- Decompression RSS delta: 2336
+- Peak RSS (VmHWM): 588248
 
 Unique symbols: 256
 Bits per symbol index: 0

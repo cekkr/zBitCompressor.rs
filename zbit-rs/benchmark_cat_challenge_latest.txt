@@ -1,5 +1,5 @@
 zBit-rs Real File Benchmark Report
-Generated: 2026-05-07 18:49:41
+Generated: 2026-05-07 19:32:10
 Input file: /home/riccardo/Sources/GitHub/zBitCompressor.rs/assets/cat_challenge.png
 Compressed artifact: /home/riccardo/Sources/GitHub/zBitCompressor.rs/zbit-rs/benchmark_cat_challenge.zbpk
 
@@ -27,32 +27,32 @@ Compressed size (bytes): 2670718
 Compression ratio (compressed/original): 0.899412
 Space savings (%): 10.06
 
-Compression time (ms): 100856.977
-Decompression time (ms): 9604.561
-Compression throughput (MiB/s): 0.028
-Decompression throughput (MiB/s): 0.295
+Compression time (ms): 112499.682
+Decompression time (ms): 9637.900
+Compression throughput (MiB/s): 0.025
+Decompression throughput (MiB/s): 0.294
 
 Candidate timing breakdown (ms):
-- index stream build: 525.625
-- huffman stream build: 624.174
-- raw-deflate encode: 537.744
-- raw-zstd encode: 719.680
-- raw-xz encode: 875.265
-- framed extraction: 3976.563
-- recursive preflate search: 40855.428
-- recursive transform sampling: 847.324
-- recursive transform evaluation: 37518.271
-- recursive correction modeling: 7215.951
-- recursive total: 93206.106
+- index stream build: 520.236
+- huffman stream build: 625.880
+- raw-deflate encode: 537.216
+- raw-zstd encode: 708.519
+- raw-xz encode: 857.853
+- framed extraction: 3996.943
+- recursive preflate search: 41072.187
+- recursive transform sampling: 865.110
+- recursive transform evaluation: 48908.600
+- recursive correction modeling: 7203.858
+- recursive total: 104867.279
 - candidate validation: 0.000
 
 Resource usage (KiB):
-- RSS before compression: 5788
-- RSS after compression: 501756
-- RSS after decompression: 518312
-- Compression RSS delta: 495968
+- RSS before compression: 5792
+- RSS after compression: 451636
+- RSS after decompression: 468192
+- Compression RSS delta: 445844
 - Decompression RSS delta: 16556
-- Peak RSS (VmHWM): 3367984
+- Peak RSS (VmHWM): 3410588
 
 Unique symbols: 256
 Bits per symbol index: 0

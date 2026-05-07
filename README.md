@@ -236,19 +236,19 @@ Current snapshot (reports generated on 2026-05-07):
 
 | Test | Input | Selected method/profile | Original -> Compressed (bytes) | Ratio | Savings | Compression ms | Decompression ms | Peak RSS KiB | Validation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `229.356` | `1.215` | `143612` | `PASS` |
-| Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `16414.882` | `145.228` | `589884` | `PASS` |
-| Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `100856.977` | `9604.561` | `3367984` | `PASS` |
-| Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `108493.158` | `9576.912` | `3374264` | `PASS` |
+| Paper benchmark | `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62015 -> 20632` | `0.332694` | `66.73%` | `221.608` | `1.119` | `145936` | `PASS` |
+| Primary binary benchmark | `assets/primary.3b.bin` | `monotonic-delta` | `3233613 -> 562836` | `0.174058` | `82.59%` | `16634.566` | `151.082` | `588248` | `PASS` |
+| Cat challenge benchmark | `assets/cat_challenge.png` | `recursive-circuit-xz` | `2969404 -> 2670718` | `0.899412` | `10.06%` | `112499.682` | `9637.900` | `3410588` | `PASS` |
+| Cat challenge stream benchmark | `assets/cat_challenge.png` | `wide-overfit stream` | `2969404 -> 2670846` | `0.899455` | `10.05%` | `115086.113` | `9613.753` | `3357636` | `PASS` |
 
 ### Latest Cat Stream Multilevel Profiles
 
 | Profile | Ratio | Savings | Original -> Compressed (bytes) | Compression ms | Decompression ms | Compression MiB/s | Decompression MiB/s | Compression RSS delta KiB | Decompression RSS delta KiB | Peak RSS KiB | Validation | Resume |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `realtime-fast` | `0.899597` | `10.04%` | `2969404 -> 2671266` | `123852.543` | `9595.877` | `0.023` | `0.295` | `554228` | `36372` | `3393380` | `PASS` | `PASS` |
-| `realtime-balanced` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `124218.269` | `9590.621` | `0.023` | `0.295` | `486200` | `15820` | `3376808` | `PASS` | `PASS` |
-| `realtime-deep` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `127240.705` | `9581.806` | `0.022` | `0.296` | `571988` | `0` | `3361376` | `PASS` | `PASS` |
-| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `108249.214` | `9639.225` | `0.026` | `0.294` | `465488` | `3536` | `3397000` | `PASS` | `PASS` |
+| `realtime-fast` | `0.899597` | `10.04%` | `2969404 -> 2671266` | `137820.970` | `9654.720` | `0.021` | `0.293` | `553200` | `624` | `3407188` | `PASS` | `PASS` |
+| `realtime-balanced` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `127023.717` | `9803.588` | `0.022` | `0.289` | `464940` | `18588` | `3392504` | `PASS` | `PASS` |
+| `realtime-deep` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `127886.368` | `9626.080` | `0.022` | `0.294` | `573212` | `2768` | `3412220` | `PASS` | `PASS` |
+| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `109886.203` | `9612.017` | `0.026` | `0.295` | `515828` | `1900` | `3410564` | `PASS` | `PASS` |
 
 Latest outputs for the tracked tests are written to:
 

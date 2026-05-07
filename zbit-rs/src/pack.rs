@@ -238,6 +238,9 @@ enum CircuitTransformKind {
     Identity,
     DeltaPrev,
     XorPrev,
+    BitPlaneTranspose,
+    BitPlaneTransposeDelta,
+    BitPlaneTransposeXor,
     PeriodicHeadTail,
     PeriodicGather,
     PeriodicDelta,
@@ -258,6 +261,9 @@ impl CircuitTransformKind {
             Self::Identity => "identity",
             Self::DeltaPrev => "delta-prev",
             Self::XorPrev => "xor-prev",
+            Self::BitPlaneTranspose => "bit-plane-transpose",
+            Self::BitPlaneTransposeDelta => "bit-plane-transpose-delta",
+            Self::BitPlaneTransposeXor => "bit-plane-transpose-xor",
             Self::PeriodicHeadTail => "periodic-head-tail",
             Self::PeriodicGather => "periodic-gather",
             Self::PeriodicDelta => "periodic-delta",
@@ -278,18 +284,21 @@ impl CircuitTransformKind {
             Self::Identity => 0,
             Self::DeltaPrev => 1,
             Self::XorPrev => 2,
-            Self::PeriodicHeadTail => 3,
-            Self::PeriodicGather => 4,
-            Self::PeriodicDelta => 5,
-            Self::PeriodicXor => 6,
-            Self::PeriodicGatherDelta => 7,
-            Self::PeriodicGatherXor => 8,
-            Self::PeriodicHeadTailTailGather => 9,
-            Self::PeriodicHeadTailTailGatherDelta => 10,
-            Self::PeriodicHeadTailTailDelta => 11,
-            Self::PeriodicHeadTailTailXor => 12,
-            Self::PeriodicHeadTailDelta => 13,
-            Self::PeriodicHeadTailXor => 14,
+            Self::BitPlaneTranspose => 3,
+            Self::BitPlaneTransposeDelta => 16,
+            Self::BitPlaneTransposeXor => 17,
+            Self::PeriodicHeadTail => 4,
+            Self::PeriodicGather => 5,
+            Self::PeriodicDelta => 6,
+            Self::PeriodicXor => 7,
+            Self::PeriodicGatherDelta => 8,
+            Self::PeriodicGatherXor => 9,
+            Self::PeriodicHeadTailTailGather => 10,
+            Self::PeriodicHeadTailTailGatherDelta => 11,
+            Self::PeriodicHeadTailTailDelta => 12,
+            Self::PeriodicHeadTailTailXor => 13,
+            Self::PeriodicHeadTailDelta => 14,
+            Self::PeriodicHeadTailXor => 15,
         }
     }
 
@@ -298,18 +307,21 @@ impl CircuitTransformKind {
             0 => Some(Self::Identity),
             1 => Some(Self::DeltaPrev),
             2 => Some(Self::XorPrev),
-            3 => Some(Self::PeriodicHeadTail),
-            4 => Some(Self::PeriodicGather),
-            5 => Some(Self::PeriodicDelta),
-            6 => Some(Self::PeriodicXor),
-            7 => Some(Self::PeriodicGatherDelta),
-            8 => Some(Self::PeriodicGatherXor),
-            9 => Some(Self::PeriodicHeadTailTailGather),
-            10 => Some(Self::PeriodicHeadTailTailGatherDelta),
-            11 => Some(Self::PeriodicHeadTailTailDelta),
-            12 => Some(Self::PeriodicHeadTailTailXor),
-            13 => Some(Self::PeriodicHeadTailDelta),
-            14 => Some(Self::PeriodicHeadTailXor),
+            3 => Some(Self::BitPlaneTranspose),
+            16 => Some(Self::BitPlaneTransposeDelta),
+            17 => Some(Self::BitPlaneTransposeXor),
+            4 => Some(Self::PeriodicHeadTail),
+            5 => Some(Self::PeriodicGather),
+            6 => Some(Self::PeriodicDelta),
+            7 => Some(Self::PeriodicXor),
+            8 => Some(Self::PeriodicGatherDelta),
+            9 => Some(Self::PeriodicGatherXor),
+            10 => Some(Self::PeriodicHeadTailTailGather),
+            11 => Some(Self::PeriodicHeadTailTailGatherDelta),
+            12 => Some(Self::PeriodicHeadTailTailDelta),
+            13 => Some(Self::PeriodicHeadTailTailXor),
+            14 => Some(Self::PeriodicHeadTailDelta),
+            15 => Some(Self::PeriodicHeadTailXor),
             _ => None,
         }
     }
@@ -2125,11 +2137,62 @@ fn invert_head_tail_xor(
     invert_periodic_head_tail(&recovered, original_len, period, head)
 }
 
+fn apply_bit_plane_transpose(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let n = data.len();
+    let mut out = vec![0u8; n];
+    for (byte_idx, &byte) in data.iter().enumerate() {
+        for bit in 0..8usize {
+            if ((byte >> bit) & 1) == 0 {
+                continue;
+            }
+            let dst_bit_index = bit * n + byte_idx;
+            let dst_byte = dst_bit_index >> 3;
+            let dst_bit = dst_bit_index & 7;
+            out[dst_byte] |= 1u8 << dst_bit;
+        }
+    }
+    out
+}
+
+fn invert_bit_plane_transpose(data: &[u8], original_len: usize) -> Option<Vec<u8>> {
+    if data.len() != original_len {
+        return None;
+    }
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    let n = original_len;
+    let mut out = vec![0u8; n];
+    for bit in 0..8usize {
+        for byte_idx in 0..n {
+            let src_bit_index = bit.checked_mul(n).and_then(|v| v.checked_add(byte_idx))?;
+            let src_byte = *data.get(src_bit_index >> 3)?;
+            let src_bit = (src_byte >> (src_bit_index & 7)) & 1;
+            if src_bit != 0 {
+                out[byte_idx] |= 1u8 << bit;
+            }
+        }
+    }
+    Some(out)
+}
+
 fn apply_transform_plan(data: &[u8], plan: &CircuitTransformPlan) -> Option<Vec<u8>> {
     match plan.kind {
         CircuitTransformKind::Identity => Some(data.to_vec()),
         CircuitTransformKind::DeltaPrev => Some(apply_unary_delta(data)),
         CircuitTransformKind::XorPrev => Some(apply_unary_xor(data)),
+        CircuitTransformKind::BitPlaneTranspose => Some(apply_bit_plane_transpose(data)),
+        CircuitTransformKind::BitPlaneTransposeDelta => {
+            let transposed = apply_bit_plane_transpose(data);
+            Some(apply_unary_delta(&transposed))
+        }
+        CircuitTransformKind::BitPlaneTransposeXor => {
+            let transposed = apply_bit_plane_transpose(data);
+            Some(apply_unary_xor(&transposed))
+        }
         CircuitTransformKind::PeriodicHeadTail => {
             apply_periodic_head_tail(data, plan.period as usize, plan.head as usize)
         }
@@ -2191,6 +2254,21 @@ fn invert_transform_plan(
             } else {
                 None
             }
+        }
+        CircuitTransformKind::BitPlaneTranspose => invert_bit_plane_transpose(data, original_len),
+        CircuitTransformKind::BitPlaneTransposeDelta => {
+            if data.len() != original_len {
+                return None;
+            }
+            let recovered = invert_unary_delta(data);
+            invert_bit_plane_transpose(&recovered, original_len)
+        }
+        CircuitTransformKind::BitPlaneTransposeXor => {
+            if data.len() != original_len {
+                return None;
+            }
+            let recovered = invert_unary_xor(data);
+            invert_bit_plane_transpose(&recovered, original_len)
         }
         CircuitTransformKind::PeriodicHeadTail => {
             invert_periodic_head_tail(data, original_len, plan.period as usize, plan.head as usize)
@@ -2564,6 +2642,17 @@ fn build_topology_for_plan(plan: &CircuitTransformPlan) -> ZbitResult<Vec<Circui
         CircuitTransformKind::XorPrev => {
             let _ = push_topology_node(&mut nodes, root_id, 0, 0, 3, 1, 0);
         }
+        CircuitTransformKind::BitPlaneTranspose => {
+            let _ = push_topology_node(&mut nodes, root_id, 0, 0, 19, 8, 0);
+        }
+        CircuitTransformKind::BitPlaneTransposeDelta => {
+            let bitplane_id = push_topology_node(&mut nodes, root_id, 0, 0, 19, 8, 0);
+            let _ = push_topology_node(&mut nodes, bitplane_id, 0, 0, 20, 1, 0);
+        }
+        CircuitTransformKind::BitPlaneTransposeXor => {
+            let bitplane_id = push_topology_node(&mut nodes, root_id, 0, 0, 19, 8, 0);
+            let _ = push_topology_node(&mut nodes, bitplane_id, 0, 0, 21, 1, 0);
+        }
         CircuitTransformKind::PeriodicHeadTail => {
             let split_id = push_topology_node(&mut nodes, root_id, 0, 0, 4, plan.period, plan.head);
             let _ = push_topology_node(&mut nodes, split_id, 1, 0, 10, plan.head, 0);
@@ -2693,6 +2782,21 @@ fn choose_adaptive_transform_plan(
         },
         CircuitTransformPlan {
             kind: CircuitTransformKind::XorPrev,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::BitPlaneTranspose,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::BitPlaneTransposeDelta,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::BitPlaneTransposeXor,
             period: 0,
             head: 0,
         },
@@ -2941,6 +3045,21 @@ fn choose_adaptive_transform_plan(
         },
         CircuitTransformPlan {
             kind: CircuitTransformKind::XorPrev,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::BitPlaneTranspose,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::BitPlaneTransposeDelta,
+            period: 0,
+            head: 0,
+        },
+        CircuitTransformPlan {
+            kind: CircuitTransformKind::BitPlaneTransposeXor,
             period: 0,
             head: 0,
         },
