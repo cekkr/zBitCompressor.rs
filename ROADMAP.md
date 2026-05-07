@@ -1,533 +1,1076 @@
-# ROADMAP.md
+# zBit Circuit-Based Compression Roadmap
+
+_Last updated: 2026-05-07_
 
 ## Purpose
 
-This roadmap captures the next implementation work for improving zBit compression speed, streaming performance, cat challenge compression ratio, and circuit-map generation/simplification quality.
+This roadmap is focused on the next large leap for `zBitCompressor.rs`: drastically improving compression ratio in both normal `.zbpk` mode and streaming `.zbps` mode by turning the current recursive transform metadata into a real, reusable, content-linked circuit system.
 
-It is grounded in:
+The central goal is no longer just “try more codecs” or “add more local transforms”. The next goal is to let the compressor discover a circuit once, cache it, simplify it, and reference it quickly from many distant regions of the same file, including regions that are not adjacent and do not look identical until the right reversible transform, predictor, bit-plane view, or residual model is applied.
 
-- `papers/zbit-algorithmsResearch.md`
-- `zbit-rs/src/pack.rs`
-- `zbit-rs/src/pack_rules.rs`
-- `zbit-rs/src/circuit.rs`
-- `zbit-rs/src/advanced.rs`
-- current benchmark reports under `zbit-rs/`
+The decoder must remain byte-exact and self-contained. Compression-time caches may be aggressive and persistent, but the compressed artifact must contain every dictionary, circuit, residual, schedule, and dependency needed for deterministic decompression.
 
-## Current Baseline
+## Current Baseline From the Code
 
-As of 2026-05-07, the cat challenge real-file benchmark selects `recursive-circuit-xz`:
+The implementation is already beyond the first version of the old roadmap:
 
-- Input: `assets/cat_challenge.png`
-- Original bytes: `2,969,404`
-- Compressed bytes: `2,670,718`
-- Ratio: `0.899412`
-- Savings: `10.06%`
-- Compression time: about `617,252 ms`
-- Decompression time: about `9,465 ms`
+- `zbit-rs/Cargo.toml` already includes `rayon`.
+- `choose_best_codec` already evaluates multiple XZ candidates in parallel and adds a zstd candidate.
+- `choose_adaptive_transform_plan` already samples many reversible transform plans, evaluates selected plans in parallel, and does winner-only XZ extreme refinement.
+- `build_recursive_circuit_stream` already searches preflate chain candidates in parallel and models correction streams.
+- `PackStats`, `StreamPackStats`, benchmark reports, active profile reporting, skipped-candidate notes, and timing breakdowns already exist.
+- Stream mode already has key-piece blocks, split/group nodes, `wide_overfitting_circuits`, shared grouping payload support, and key-piece resume validation.
 
-The stream multilevel benchmark reaches approximately the same ratio but remains very slow:
+Current tracked benchmark snapshot:
 
-- `realtime-fast`: ratio `0.899597`, compression about `649,140 ms`
-- `realtime-balanced`: ratio `0.899455`, compression about `1,079,594 ms`
-- `realtime-deep`: ratio `0.899455`, compression about `1,054,403 ms`
-- `wide-overfit`: ratio `0.899455`, compression about `622,578 ms`
+| Corpus / mode | Selected method | Original bytes | Compressed bytes | Ratio | Main bottleneck |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `papers/zbit-algorithmsResearch.md` | `raw-xz` | `62,015` | `20,632` | `0.332694` | generic text codec selection |
+| `assets/primary.3b.bin` | `monotonic-delta` | `3,233,613` | `562,836` | `0.174058` | framed scan overhead, not ratio |
+| cat challenge normal | `recursive-circuit-xz` | `2,969,404` | `2,670,718` | `0.899412` | preflate + transformed payload coding |
+| cat challenge stream wide/shared | global/slice recursive pack | `2,969,404` | `2,670,846` | `0.899455` | global payload construction and validation |
 
-The current quality is acceptable for a validation prototype but not for a practical compressor. The major speed issue is sequential candidate exploration across preflate reconstruction, transform selection, XZ/LZMA profiles, zstd probes, recursive validation, and stream block/group decisions.
+The important limitation is architectural:
 
-## Implementation Observations
+- `CircuitTopologyNode` currently serializes transform metadata and hashes, not a true reusable circuit graph.
+- `recursive-circuit-xz` transforms one inflated payload and one correction stream; it does not yet build a global circuit atlas with reusable subgraphs.
+- `indexed-circuit` is intentionally skipped for byte streams because `symbol_bits <= 8`; the existing symbol-level circuit dictionary is not useful for large byte-level file structure.
+- Stream `GlobalSlice` gives good ratio by storing one whole-file compressed payload and slicing decoded output, but this is not the same as restart-safe shared circuit reuse. It still requires the global output to be reconstructed before the slice can be used.
+- `build_best_stream_node` uses per-block memoization, but there is no cross-block cache of equivalent circuits, transforms, residual models, or encoded candidates.
+- The compressor has no content-addressed index that can connect “this region here is produced by the same circuit as that distant region there, with a small patch”.
 
-- `zbit-rs/Cargo.toml` currently has no parallel execution dependency. Most independent compression candidates are evaluated serially.
-- `compress_adaptive_to_bytes` evaluates raw, indexed, Huffman, deflate, zstd, xz, framed, recursive-circuit, and monotonic candidates in one sequential path.
-- `choose_best_codec` tries multiple XZ profiles, optional XZ extreme profiles, and zstd sequentially.
-- `choose_adaptive_transform_plan` builds a large transform candidate set, scores samples, then fully evaluates selected plans sequentially.
-- `build_recursive_circuit_stream` tries preflate chain-length candidates sequentially.
-- Streaming compression builds key-piece blocks serially and calls recursive full-file/global-overfit compression for the best cat challenge ratios.
-- The Boolean circuit optimizer in `advanced.rs` is mostly a cover-level optimizer; the byte-stream `recursive-circuit-xz` topology in `pack.rs` is a transform metadata graph, not a full AIG/XAG circuit-map optimizer.
-- Current `indexed-circuit` is skipped for normal byte inputs because `symbol_bits <= 8`; this is correct for simple byte dictionaries but means the circuit-map machinery is not yet used to model byte-plane, bit-plane, row/column, or container reconstruction structure.
+This roadmap therefore treats the next version as a **Circuit Atlas compressor**.
 
-## Roadmap Themes
+## Target Architecture: Circuit Atlas
 
-The paper's main guidance remains the right direction:
+A **Circuit Atlas** is a global dictionary of reusable reversible circuits, predictors, transforms, and residual encoders discovered over the whole input. It must be usable in normal mode and stream mode.
 
-- use exact minimization only on bounded local windows,
-- use graph/network rewriting as the scalable engine,
-- exploit don't-cares aggressively but locally,
-- use SAT as a selective exact oracle,
-- keep representation and cost models fluid.
+A circuit atlas entry should answer:
 
-For this repository, those ideas should be applied to compression as a costed search problem:
+1. What transformation or predictor graph is shared?
+2. Which file ranges use it?
+3. Which range-specific parameters are needed?
+4. Which residual bytes or correction records remain after applying it?
+5. What is the exact inverse/decode schedule?
+6. How much dictionary cost is amortized by all references?
 
-- dictionary bytes,
-- encoded payload bytes,
-- correction bytes,
-- decode cost,
-- memory cost,
-- key-piece restart cost,
-- validation cost.
+### Design Principles
 
-## Phase 0: Measurement and Candidate Control
+- **Self-contained compressed files:** never require an external cache to decode.
+- **Compression cache is allowed; decode cache is optional:** compression may use persistent and in-memory caches to find candidates quickly, but the final artifact embeds the selected atlas.
+- **References must be explicit:** a distant region may reference a shared circuit ID, but the decoder must know how to reconstruct that region without guessing.
+- **Circuit reuse is selected by cost, not by excitement:** a shared circuit is emitted only if dictionary cost plus reference/residual cost beats independent encoding.
+- **Cross-file learning is allowed only as a compressor hint:** persistent learned atlases can speed up discovery, but if a learned circuit is used, its serialized form must be embedded in the output.
+- **Stream restart constraints are first-class:** a stream key-piece must be decodable from its key boundary using only global atlas dictionaries and local/key-piece residual payloads, not by reconstructing the whole original file first.
+
+## Phase 0: Stabilize the Current Pipeline Before Adding Atlas Logic
 
 Priority: immediate.
 
-### Add Per-Candidate Timing
+### 0.1 Rename and Clarify Current “Circuit” Paths
 
-Extend `PackStats`, `StreamPackStats`, and benchmark reports with timings for:
+Current names make the implementation look more circuit-based than it really is. Rename or document internally:
 
-- index stream construction,
-- Huffman stream construction,
-- raw deflate,
-- raw zstd,
-- raw xz,
-- framed container extraction,
-- preflate reconstruction,
-- transform-plan sampling,
-- transform-plan full evaluation,
-- correction-stream modeling,
-- final candidate validation,
-- stream block tree construction,
-- stream global shared/wide payload construction.
+- `recursive-circuit-xz` means: framed payload extraction + preflate reconstruction + reversible transform metadata + encoded transformed payload + encoded correction payload.
+- `CircuitTopologyNode` means: transform topology metadata, not a minimized AIG/XAG circuit graph.
+- `wide_overfitting_circuits` means: whole-file global pack + output slice nodes, not stream-safe shared circuit dictionaries.
 
-Acceptance criteria:
+Implementation guidance:
 
-- Cat challenge report identifies the top three time consumers without `ZBIT_TRACE_*`.
-- Stream report separates global-overfit time from local block/group selection time.
-
-### Add Candidate Budgets
-
-Introduce explicit compression profiles:
-
-- `fast`: zstd-first, limited transform search, no XZ extreme, bounded preflate candidates.
-- `balanced`: current quality target with parallelized candidate search.
-- `deep`: broader transform/preflate/codec search with strict time and memory budgets.
-- `research`: exhaustive/probing mode, allowed to be slow.
+- Keep public method names stable until format migration is ready.
+- Add comments near `RecursiveCircuitStream`, `CircuitTopologyNode`, `StreamNodeKind::GlobalSlice`, and `ZBPS_FLAG_WIDE_OVERFITTING_CIRCUITS` explaining the current semantics.
+- In benchmark reports, add a note differentiating:
+  - `global-output-slice` reuse,
+  - `shared-grouping-payload`,
+  - future `shared-circuit-atlas` reuse.
 
 Acceptance criteria:
 
-- Existing tests continue to use deterministic defaults.
-- Benchmarks print the active profile and skipped candidates with reasons.
+- No behavior change.
+- Reports no longer imply that stream mode is already doing true shared circuit-map reuse.
 
-### Add Early Rejection
+### 0.2 Split `pack.rs` Into Implementation Modules
 
-Add cheap lower-bound and upper-bound controls:
+`zbit-rs/src/pack.rs` is now carrying too many responsibilities. Before adding atlas logic, split code into modules while preserving public APIs.
 
-- stop a codec profile once its output is already larger than the current best plus header overhead, when the encoder supports progress accounting or bounded output,
-- skip recursive-circuit evaluation when framed extraction plus best-known correction lower bound cannot beat current best,
-- skip full transform evaluation when sample score is worse than the current best by a calibrated margin,
-- store candidate reasons in the report.
+Suggested module split:
 
-Acceptance criteria:
-
-- `fast` cat challenge compression time drops substantially while retaining the current `framed-raw` or better fallback.
-- `balanced` never loses more than a small configured ratio delta without reporting the skipped candidate.
-
-## Phase 1: Parallelization
-
-Priority: immediate after measurement.
-
-### Add a Parallel Execution Layer
-
-Add `rayon` or a small scoped-thread executor to run independent compression candidates concurrently.
-
-Parallelize:
-
-- top-level pack candidates in `compress_adaptive_to_bytes`,
-- raw codec candidates (`deflate`, `zstd`, `xz`) where memory allows,
-- XZ profile trials inside `build_raw_xz_payload` and `choose_best_codec`,
-- selected transform-plan full evaluations,
-- preflate chain-length candidates in `build_recursive_circuit_stream`,
-- stream key-piece block construction,
-- stream profile scripts when running benchmark matrices.
-
-Guardrails:
-
-- use a global worker budget to avoid running multiple high-memory XZ encoders at once,
-- avoid cloning multi-MiB buffers per candidate when a shared slice is enough,
-- collect deterministic results and sort by stable candidate ID before final selection,
-- keep decompression single-thread-compatible.
+```text
+zbit-rs/src/pack/
+  mod.rs                    # public pack/stream API and format dispatch
+  format.rs                 # ZBPK/ZBPS headers, read/write helpers, versioning
+  codecs.rs                 # raw/deflate/zstd/xz encode/decode and candidate selection
+  transforms.rs             # CircuitTransformKind, plan apply/invert, scoring
+  framed.rs                 # CRC32-framed run detector/rebuilder
+  recursive.rs              # RecursiveCircuitStream + preflate correction path
+  monotonic.rs              # monotonic-delta candidate
+  stream.rs                 # ZBPS block/node planner/decode
+  stats.rs                  # PackStats, StreamPackStats, timings
+  cache.rs                  # compression-time memoization hooks
+  atlas.rs                  # new circuit atlas candidate path
+```
 
 Acceptance criteria:
 
-- Same chosen method and same output bytes for deterministic profiles.
-- Cat challenge `balanced` compression time target: below `180 s` first, then below `60 s`.
-- Stream `wide-overfit` target: below `180 s` first, then below `60 s`, without ratio regression.
+- `cargo test --manifest-path zbit-rs/Cargo.toml` passes.
+- Benchmarks produce byte-identical compressed outputs for deterministic profiles, except for allowed header/report-only differences.
+- Future atlas code can be added without growing a single 200k+ byte file further.
 
-### Remove Duplicate Work
+### 0.3 Add a Real Compression Context Object
 
-Add memoization for:
+Current functions pass mutable timings and skipped-candidate vectors through many call stacks. Replace this with a context object that also owns caches and budgets.
 
-- transformed samples by `(input_hash, range, transform_plan)`,
-- full transformed payloads selected for recursive candidates,
-- preflate outputs by `(deflate_hash, max_chain_length)`,
-- codec outputs by `(payload_hash, codec_profile)`,
-- stream range pack candidates across adjacent blocks when the same merged range is evaluated.
+Suggested structure:
+
+```rust
+pub(crate) struct CompressionContext {
+    pub profile: CompressionProfile,
+    pub timings: CandidateTimingStats,
+    pub skipped_candidates: Vec<String>,
+    pub cache: CompressionCache,
+    pub budgets: CompressionBudgets,
+    pub trace: TraceFlags,
+}
+```
+
+Use it in:
+
+- `compress_adaptive_to_bytes`
+- `build_recursive_circuit_stream`
+- `choose_adaptive_transform_plan`
+- `choose_best_codec`
+- `compress_stream_to_bytes`
+- `build_best_stream_node`
+- future atlas builder functions
 
 Acceptance criteria:
 
-- Stream non-wide shared payload mode does not recompute full-file recursive candidates unnecessarily.
-- Benchmark reports include cache hit/miss counters.
+- Existing stats are still reported.
+- Cache hit/miss counters can be added without changing every function signature again.
 
-## Phase 2: Cat Challenge Ratio Improvements
+## Phase 1: Content-Addressed Compression Cache
+
+Priority: immediate for speed and necessary for deep atlas search.
+
+The current code recomputes many expensive candidates for equivalent payloads, adjacent merged stream ranges, and repeated transform outputs. A cache layer is required before adding much deeper candidate discovery.
+
+### 1.1 Add Stable Fingerprints
+
+Add a lightweight fingerprint type for compression-time lookup.
+
+Suggested dependencies:
+
+```toml
+blake3 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+smallvec = "1"
+```
+
+Use two levels:
+
+- `xxh3_64` or equivalent for fast table lookup.
+- `blake3` or full byte equality check for collision safety when reusing payloads.
+
+Suggested key:
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct PayloadHash {
+    pub fast64: u64,
+    pub strong128: [u8; 16],
+    pub len: usize,
+}
+```
+
+Never trust a fast hash alone for byte-perfect reconstruction. Use it to find candidates, then verify full bytes or strong hash before reuse.
+
+### 1.2 Cache Expensive Candidate Outputs
+
+Add `CompressionCache` with separate namespaces:
+
+```rust
+pub(crate) struct CompressionCache {
+    pub codec_outputs: HashMap<(PayloadHash, CodecProfileKey), EncodedPayload>,
+    pub transform_outputs: HashMap<(PayloadHash, CircuitTransformPlan), Vec<u8>>,
+    pub transform_scores: HashMap<(PayloadHash, CircuitTransformPlan, SampleKey), usize>,
+    pub preflate_outputs: HashMap<(PayloadHash, PreflateKey), PreflateResultSummary>,
+    pub range_candidates: HashMap<RangeCandidateKey, PackedRangeCandidate>,
+    pub atlas_candidates: HashMap<AtlasCandidateKey, AtlasCandidateSummary>,
+}
+```
+
+Cache these immediately:
+
+- `apply_transform_plan(data, plan)` outputs.
+- quick sample zstd scores in `choose_adaptive_transform_plan`.
+- final `choose_best_codec` outputs.
+- preflate results by `(deflate_stream_hash, max_chain_length)`.
+- correction transform/coding candidates.
+- `stream_pack_range_candidate` across all stream blocks, not only inside one block.
+
+### 1.3 Cross-Block Stream Cache
+
+Currently each block creates a new `pack_cache` in `compress_stream_to_bytes`. Promote it to the stream-level context.
+
+Change:
+
+```rust
+for block_index in 0..block_count {
+    let mut pack_cache = HashMap::new();
+    ...
+}
+```
+
+to:
+
+```rust
+let mut stream_range_cache = HashMap::new();
+for block_index in 0..block_count {
+    ... use &mut stream_range_cache ...
+}
+```
+
+Then make range keys absolute:
+
+```rust
+struct RangeCandidateKey {
+    input_hash: PayloadHash,
+    abs_start_chunk: usize,
+    abs_end_chunk: usize,
+    realtime_mode: bool,
+    allow_recursive: bool,
+    profile: CompressionProfile,
+}
+```
+
+Acceptance criteria:
+
+- Stream reports include cache hits/misses for range candidates, codecs, transforms, and preflate.
+- Repeated stream benchmark warm runs are materially faster.
+- No cache hit is accepted without collision-safe validation.
+
+### 1.4 Persistent Compressor-Side Atlas Cache
+
+Add an optional cache directory controlled by environment variables:
+
+```text
+ZBIT_CACHE_DIR=.zbit-cache
+ZBIT_ENABLE_PERSISTENT_CACHE=1
+ZBIT_CACHE_MAX_BYTES=...
+```
+
+Persist only compression hints:
+
+- fingerprints of successful transform plans,
+- preflate parameter winners,
+- codec profile winners,
+- reusable circuit signatures,
+- nonlocal range-match indexes.
+
+Do not require this cache for decode. If a persistent circuit is selected, serialize the circuit into the `.zbpk` or `.zbps` output.
+
+Acceptance criteria:
+
+- Cold runs work exactly as before.
+- Warm runs can skip expensive failed candidates.
+- Cache entries are versioned by format version, transform version, codec key, and profile.
+
+## Phase 2: Global Nonlocal Match and Circuit Discovery
+
+Priority: highest for drastic ratio improvement.
+
+The current compressor mostly models one contiguous transformed payload at a time. The next improvement is to find relationships between distant regions.
+
+### 2.1 Multi-Scale Content-Defined Segmentation
+
+Before building circuits, segment input at multiple scales:
+
+- fixed windows: 256 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB, 256 KiB, 1 MiB;
+- content-defined chunks using Gear/Rabin-style rolling hashes;
+- format-derived boundaries from framed/container analyzers;
+- stream chunks and key-piece blocks;
+- row/tile boundaries for image-like inflated payloads;
+- correction-record boundaries for preflate corrections.
+
+Create:
+
+```rust
+pub(crate) struct Segment {
+    pub id: SegmentId,
+    pub offset: usize,
+    pub len: usize,
+    pub origin: SegmentOrigin,
+    pub fingerprints: SegmentFingerprints,
+}
+```
+
+Compute fingerprints over several normalized views:
+
+- raw bytes,
+- delta-prev,
+- xor-prev,
+- bit-plane transpose,
+- periodic gather candidates,
+- low-byte/high-byte planes,
+- row predictor residual views when geometry is known,
+- correction-record typed streams.
+
+### 2.2 Build a Nonlocal Occurrence Index
+
+Add an index that can answer:
+
+- Where else did this exact segment occur?
+- Where else did this transformed view occur?
+- Which far-away segments are similar enough to patch cheaply?
+- Which circuit signature appears many times?
+
+Suggested structure:
+
+```rust
+pub(crate) struct OccurrenceIndex {
+    exact: HashMap<PayloadHash, SmallVec<[SegmentId; 4]>>,
+    normalized: HashMap<NormalizedHash, SmallVec<[SegmentViewId; 4]>>,
+    simhash_buckets: HashMap<SimBucket, SmallVec<[SegmentViewId; 8]>>,
+    ngram_buckets: HashMap<NGramHash, SmallVec<[SegmentViewId; 8]>>,
+}
+```
+
+Use bounded candidate lists to avoid explosion:
+
+- cap per bucket by profile,
+- keep far-distance and diverse-context candidates,
+- prefer matches with repeated occurrences,
+- discard candidates that cannot amortize dictionary bytes.
+
+### 2.3 Transformed Reference Candidates
+
+For every promising pair `(source, target)`, try reversible links:
+
+```text
+target ≈ transform(source, params) + residual
+```
+
+Candidate transforms:
+
+- identity copy,
+- xor with previous byte,
+- modular delta,
+- add/subtract constant,
+- byte rotation / bit rotation,
+- bit-plane transpose,
+- low/high nibble split,
+- channel/plane permutation,
+- periodic gather/scatter,
+- row/column predictor residual,
+- sparse patch over exact/near-exact reference,
+- small affine GF(2) mapping over bit windows.
+
+Represent a link as:
+
+```rust
+pub(crate) struct CircuitLinkCandidate {
+    pub source: SegmentId,
+    pub target: SegmentId,
+    pub circuit: CircuitId,
+    pub params: LinkParams,
+    pub residual_model: ResidualModel,
+    pub estimated_cost: BitCost,
+    pub verified: bool,
+}
+```
+
+The target range is encoded as a reference to the source circuit plus residual payload, not as an independent codec payload.
+
+Acceptance criteria:
+
+- Distant repeated or near-repeated regions are detected even when separated by megabytes.
+- The compressor can emit a nonlocal reference candidate for normal `.zbpk` mode.
+- The same discovery engine can be reused by stream mode with stricter dependency rules.
+
+### 2.4 Sparse Patch and Residual Encoding
+
+For transformed links, residuals are the key. Add specialized residual streams:
+
+- exact-copy: no residual;
+- sparse byte patches: varint gap positions + changed byte;
+- sparse bit patches: bitset or RLE positions + xor mask;
+- dense residual: delta/xor residual bytes passed to `choose_best_codec`;
+- small alphabet residual: canonical Huffman/rANS candidate;
+- repeated residual: dictionary over residual motifs;
+- row/tile residual: per-row sparse patch or predictor residual.
+
+Suggested residual decision:
+
+```text
+if mismatch_count == 0:
+    ExactReference
+elif mismatch_count / len < sparse_threshold:
+    SparsePatch
+elif entropy(residual) < entropy(target):
+    DenseResidualCodec
+else:
+    reject link
+```
+
+Acceptance criteria:
+
+- Link reports show source offset, target offset, transform, residual type, residual bytes, and saved bytes.
+- Exact and sparse links pass roundtrip tests over random and adversarial data.
+
+## Phase 3: Real Circuit Graph Core
+
+Priority: highest after nonlocal candidate discovery.
+
+The current `src/circuit.rs` uses hash-cached `Gate` references and `BitsMap`, but it is not the right core for large compression graphs. Keep it for legacy small truth-table demos, and add a new canonical graph core.
+
+### 3.1 Add `circuit_graph.rs`
+
+Suggested node model:
+
+```rust
+pub(crate) type NodeId = u32;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum GraphOp {
+    InputByte,
+    InputBit,
+    Const(u64),
+    Not,
+    And,
+    Or,
+    Xor,
+    AddMod8,
+    SubMod8,
+    RotateLeft8(u8),
+    Gather { period: u32, lane: u32 },
+    Scatter { period: u32, lane: u32 },
+    Delta { distance: u32 },
+    XorPrev { distance: u32 },
+    Predictor(PredictorKind),
+    ResidualApply(ResidualKind),
+}
+
+pub(crate) struct CircuitGraph {
+    nodes: Vec<GraphNode>,
+    structural_index: HashMap<StructuralKey, NodeId>,
+    levels: Vec<u32>,
+    refs: Vec<u32>,
+}
+```
+
+Required properties:
+
+- stable node IDs;
+- structural hashing with equality checks;
+- commutative input normalization for `And`, `Or`, `Xor`;
+- complemented edges for cheap inversions;
+- fanout/refcount tracking;
+- topological serialization;
+- graph versioning.
+
+### 3.2 Circuit Signatures
+
+Each graph or subgraph needs reusable signatures:
+
+```rust
+pub(crate) struct CircuitSignature {
+    pub op_histogram: SmallVec<[(GraphOpClass, u16); 16]>,
+    pub input_arity: u16,
+    pub output_arity: u16,
+    pub normalized_hash: [u8; 16],
+    pub npn_hash: Option<[u8; 16]>,
+    pub affine_hash: Option<[u8; 16]>,
+}
+```
+
+Use signatures for:
+
+- exact subgraph reuse,
+- near-equivalent subgraph search,
+- NPN-canonical cut replacement,
+- persistent atlas lookup,
+- cross-region linking.
+
+### 3.3 Cut Enumeration and Exact Local Replacement
+
+Add bounded cut enumeration to simplify graphs and identify reusable components.
+
+Implementation steps:
+
+1. Enumerate cuts up to 6 inputs in fast/balanced profiles.
+2. Allow 8 to 12 inputs in deep/research profiles.
+3. Build truth tables for cuts.
+4. Canonicalize truth tables under input permutation/negation where budget allows.
+5. Lookup best known implementation from a small library.
+6. Validate replacement by exhaustive table or SAT.
+7. Accept only if compression cost improves, not only node count.
+
+Cost must include:
+
+- graph dictionary bytes,
+- parameter bytes,
+- residual bytes,
+- reference count amortization,
+- decoder work,
+- stream restart overhead.
+
+Acceptance criteria:
+
+- Reports include cuts tried, exact replacements accepted, SAT validations, dictionary bytes saved, and residual bytes changed.
+- Synthetic XOR/affine corpora improve relative to AIG-only representation.
+
+### 3.4 XOR/Affine and Modular-Byte Detection
+
+Many compression-relevant relationships are not AND/OR-heavy. Add:
+
+- GF(2) Gaussian elimination over bit windows;
+- affine relation extraction for byte/bit planes;
+- XOR divisor extraction;
+- parity/bitmask predictors;
+- modular add/subtract predictors for byte deltas;
+- XAG serialization for XOR-rich circuits.
+
+Acceptance criteria:
+
+- XOR-heavy synthetic tests show clear gains.
+- Bit-plane and delta-heavy references are represented as compact XAG/affine nodes rather than verbose generic gates.
+
+## Phase 4: Atlas Candidate Selection as Weighted Set Cover
+
+Priority: highest for real compression wins.
+
+After discovery, there may be thousands of candidate circuits and links. Selection must optimize global compressed size.
+
+### 4.1 Cost Model
+
+Define a single cost model:
+
+```text
+candidate_gain = independent_cost(target_ranges)
+               - atlas_dictionary_cost(circuit)
+               - reference_headers_cost
+               - params_cost
+               - residual_cost
+               - dependency_overhead
+               - validation_checksum_cost
+```
+
+Do not emit a circuit unless gain is positive with safety margin.
+
+Track separately:
+
+- global dictionary bytes,
+- local dictionary bytes,
+- graph topology bytes,
+- transform parameter bytes,
+- references bytes,
+- residual bytes,
+- correction bytes,
+- entropy-coded payload bytes,
+- stream restart metadata bytes.
+
+### 4.2 Non-Overlapping Range Selection
+
+A target byte range must be encoded by exactly one selected representation. Use weighted interval scheduling / DP for ranges, with atlas candidates as alternatives.
+
+Normal mode:
+
+- allow global candidates over the whole file;
+- references can point anywhere if the decode schedule is acyclic or if source bytes are already materialized;
+- a global dictionary can be decoded before payload ranges.
+
+Stream mode:
+
+- allow global dictionary circuits, but not global output dependency;
+- a block can reference:
+  - global circuit dictionary entries,
+  - local block dictionary entries,
+  - previous bytes inside the same block,
+  - explicitly carried key-piece history if configured;
+- a block must not require reconstructing unrelated future or previous blocks to resume from a key-piece.
+
+### 4.3 Greedy + Repair Strategy
+
+Use a practical two-stage selector:
+
+1. Greedy select high-gain circuits by normalized gain:
+
+```text
+score = gain / (dictionary_bytes + reference_count_penalty)
+```
+
+2. Repair overlaps with DP:
+
+- remove low-gain overlapping links,
+- re-pack uncovered gaps with current best local packers,
+- re-evaluate dictionary amortization after references are removed.
+
+Acceptance criteria:
+
+- Atlas selection never regresses against the current best adaptive method.
+- Reports explain why selected atlas candidates won.
+- Rejected high-interest candidates are visible with rejection reason: overlap, negative gain, dependency violation, restart violation, or validation failure.
+
+## Phase 5: New Normal-Mode Pack Method
 
 Priority: high.
 
-The cat challenge input is an already-compressed image container. Generic byte compressors will have limited gains. Better ratios require modeling the container, inflated data, prediction/filter structure, and preflate correction stream more effectively.
+Add a new method before trying to replace existing methods:
 
-### Improve Container Modeling
+```rust
+PackMethod::CircuitAtlas
+```
 
-Keep the core method generic, but add optional container analyzers behind a common trait:
+or, if keeping codec-specific naming:
 
-- detect chunked CRC containers,
-- parse known chunks only after validating magic/header structure,
-- model chunk lengths, tags, CRCs, and Adler/deflate wrapper fields as deterministic rebuild metadata,
-- preserve byte-perfect output through validation.
+```rust
+PackMethod::CircuitAtlasXz
+```
 
-For PNG-like data, add a dedicated analyzer module that can:
+### 5.1 `.zbpk` Format Extension
 
-- concatenate image data chunks,
-- inflate to filtered scanlines,
-- split filter bytes from row payloads,
-- detect width, height, color type, bit depth, and bytes-per-pixel,
-- reconstruct chunks and CRCs exactly.
+Bump `.zbpk` version only when the new method is serialized.
 
-Acceptance criteria:
+Suggested sections:
 
-- Generic framed path remains available.
-- PNG-like analyzer is selected only when validation proves exact reconstruction.
-- Report prints analyzer type and deterministic rebuild fields.
+```text
+ZBPK v3
+header
+method = circuit-atlas
+original_size
+atlas_dictionary_len
+atlas_dictionary
+range_program_len
+range_program
+residual_payload_len
+residual_payload
+fallback_payload_len
+fallback_payload
+validation checksum(s)
+```
 
-### Add Image-Plane and Residual Transforms
+Atlas dictionary contains:
 
-Evaluate reversible transforms before entropy coding:
+- graph entries,
+- transform entries,
+- predictor entries,
+- residual model entries,
+- codec dictionary entries if any.
 
-- row filter-byte stream split,
-- byte-plane and bit-plane split,
-- RGBA channel split,
-- reversible color transforms such as green subtraction or YCoCg-style integer transforms,
-- row/column delta,
-- PNG predictor residuals: Sub, Up, Average, Paeth,
-- local neighborhood predictors with residual escape coding,
-- alpha-plane special cases,
-- interleaved versus planar layout selection,
-- small-tile transforms for nonstationary regions.
+Range program contains ordered operations:
 
-Use the existing transform-plan/topology structure as the serialized description, but extend it from simple periodic transforms into a typed transform DAG.
+```rust
+pub(crate) enum AtlasRangeOp {
+    FallbackPack { offset, len, pack_bytes_ref },
+    ExactRef { source_offset, target_offset, len },
+    CircuitRef { circuit_id, target_offset, len, params_ref, residual_ref },
+    MaterializeTemp { temp_id, circuit_id, params_ref },
+}
+```
 
-Acceptance criteria:
+The program must materialize output ranges deterministically and validate final length/checksum.
 
-- Transform plans are validated by exact inverse tests.
-- Cat challenge `deep` ratio target: below `0.895` first, then below `0.885` if image-plane modeling is effective.
-- Reports show transformed payload bytes and correction payload bytes separately.
+### 5.2 Normal-Mode Encoder Flow
 
-### Model Preflate Corrections
+Change `compress_adaptive_to_bytes` to include atlas as a candidate:
 
-The current recursive path stores a transformed inflated payload plus preflate reconstruction corrections. Earlier notes show correction data can dominate gains. Split and model corrections by structure:
+1. Build existing candidates exactly as today.
+2. Build `CircuitAtlasCandidate` with a strict budget.
+3. Validate atlas candidate by decoding it and comparing to input.
+4. Add candidate total to `PackEvaluation`.
+5. Choose best by size.
 
-- correction record type,
-- literal/match correction,
-- distance/length correction,
-- dynamic Huffman tree correction,
-- block-boundary correction,
-- raw bytes,
-- sparse position deltas.
+Do not make atlas mandatory. It must beat current methods or be skipped.
 
-Then apply specialized encoding:
+### 5.3 Normal-Mode Decoder Flow
 
-- RLE for zero/default correction runs,
-- varint and delta coding for positions,
-- bitset coding for sparse flags,
-- context-coded small alphabets,
-- zstd dictionary training over correction records,
-- optional rANS/arithmetic coding for tiny skewed streams.
+Add `decode_circuit_atlas_payload`:
 
-Acceptance criteria:
-
-- Report breaks correction bytes down by substream.
-- Correction stream compression improves on cat challenge without weakening preflate roundtrip validation.
-
-### Improve Deflate Reconstruction Search
-
-Replace coarse `max_chain_length` probing with structured search:
-
-- infer likely compressor level and strategy,
-- estimate block boundaries,
-- reconstruct dynamic Huffman trees separately from LZ77 parse choices,
-- cache repeated tree shapes,
-- compare literal/match parse deltas rather than opaque correction blobs,
-- stop exploring candidates that cannot reduce correction entropy.
+- parse dictionary;
+- verify graph signatures/hashes;
+- execute range program;
+- decode residuals;
+- apply inverse transforms;
+- fill output ranges;
+- reject overlaps, gaps, invalid offsets, cycles, and checksum mismatches.
 
 Acceptance criteria:
 
-- Same byte-perfect reconstruction.
-- Fewer preflate candidates are needed for equal or better correction payload size.
+- Current `.zbpk` files still decode.
+- New atlas candidate can be enabled by profile or environment variable.
+- `fast` profile can skip it; `balanced` can use bounded atlas; `deep/research` can use broader atlas.
 
-## Phase 3: Circuit Map Generation and Simplification
+## Phase 6: Stream-Mode Shared Circuit Atlas
 
-Priority: high for ratio; medium for initial speed.
+Priority: high and directly requested.
 
-The current Boolean minimization engine is useful but not yet the main compression engine for large byte streams. The next step is to build a real circuit-map layer that represents predictors, transforms, and residual generation as a simplifiable network.
+The current stream mode gets good ratio mostly by storing a global pack and using `GlobalSlice`. Replace this with real shared circuit references so blocks can remain restartable without reconstructing unrelated output.
 
-### Replace Hash-Only Gate Interning With ID-Based Structural Hashing
+### 6.1 Add Stream Format Concepts
 
-Implement a canonical graph core:
+Add new ZBPS flag and node kinds:
 
-- stable node IDs,
-- structural keys using `(op, fanins, params)`,
-- complemented edges for cheap inversions,
-- collision-safe equality checks,
-- fanout/reference counts,
-- topological order cache,
-- level/depth cache,
-- deterministic serialization.
+```rust
+const ZBPS_FLAG_SHARED_CIRCUIT_ATLAS: u16 = 0x0008;
+const ZBPS_NODE_KIND_ATLAS_REF: u8 = 4;
+const ZBPS_NODE_KIND_LOCAL_ATLAS_GROUP: u8 = 5;
+```
 
-Keep `BitsMap` compatibility, but route new optimization work through the canonical graph.
+Shared section layout:
 
-Acceptance criteria:
+```text
+ZBPS header
+optional shared circuit atlas dictionary
+block 0 node program
+block 1 node program
+...
+```
 
-- Existing model tests pass.
-- Graph node counts and depth are reported before and after optimization.
-- No correctness depends only on a hash value.
+A block node may reference shared circuit IDs, but residual payloads and range schedules remain block-local unless explicitly declared global and restart-safe.
 
-### Add AIG/XAG-Oriented Map Generation
+### 6.2 Key-Piece Restart Rules
 
-Generate maps from compression-relevant structures:
+For a key-piece block starting at chunk `K`, decoding from `K` may use:
 
-- byte-plane predictors,
-- bit-plane predictors,
-- row/column neighborhoods,
-- previous-byte and previous-row contexts,
-- LZ-style match flags,
-- transform selection masks,
-- correction-stream record classifiers.
+- shared atlas dictionary stored before blocks;
+- local dictionary inside block `K`;
+- bytes reconstructed earlier inside the same block;
+- optional bounded history explicitly stored in the block header;
+- no dependency on decoded output from block `< K`, unless it is stored as independent carry state;
+- no dependency on future blocks.
 
-Use:
+Add validation:
 
-- AIG nodes for AND/inverter structure,
-- XAG nodes for XOR-heavy delta/parity/bit-plane transforms,
-- optional MIG nodes later for majority-style predictors.
-
-Acceptance criteria:
-
-- A transform candidate can emit a graph topology and a compact parameter dictionary.
-- The graph cost model includes both dictionary bytes and expected residual entropy.
-
-### Add Cut Enumeration and Exact Local Replacement
-
-Implement bounded cut enumeration:
-
-- enumerate cuts up to 6 inputs for fast paths,
-- allow 8 to 12 inputs in deep/research profiles,
-- build truth tables for each cut,
-- canonicalize cuts with NPN signatures,
-- use exact synthesis or precomputed best forms only for high-value cuts,
-- cache replacements by canonical signature.
+```rust
+validate_stream_dependencies(start_key_piece, node_program, atlas_dictionary)
+```
 
 Acceptance criteria:
 
-- Local exact replacement is deterministic and budgeted.
-- Reports include number of cuts tried, accepted, rejected, and SAT-validated.
+- Key-piece resume validation passes without decoding whole-file global output.
+- Non-wide stream mode approaches current wide-overfit ratio on cat challenge without `GlobalSlice` output dependency.
+- Reports distinguish:
+  - `global_output_slice_bytes`,
+  - `shared_atlas_dictionary_bytes`,
+  - `block_residual_bytes`,
+  - `fallback_local_pack_bytes`.
 
-### Add Resubstitution and Common-Subexpression Sharing
+### 6.3 Cross-Block Circuit Linking
 
-Add graph-level rewrites:
+Build one shared atlas over all blocks, then per-block programs reference it.
 
-- constant propagation,
-- double inversion removal,
-- idempotence,
-- absorption,
-- consensus,
-- factoring,
-- common divisor extraction,
-- fanout-aware resubstitution,
-- balancing after area-reducing rewrites,
-- shared predictor subgraphs across stream blocks.
+Algorithm:
 
-Acceptance criteria:
+1. Segment the whole input and each block.
+2. Discover candidate circuits globally.
+3. Select shared circuits with weighted set cover under restart constraints.
+4. For each block, run local DP:
+   - local piece pack,
+   - local group pack,
+   - shared atlas reference,
+   - local atlas reference,
+   - fallback raw/deflate/zstd/framed/recursive pack.
+5. Emit block-local residuals.
 
-- Node count and serialized dictionary bytes decrease on synthetic predictor-heavy tests.
-- Stream blocks can share stable subgraph IDs where key-piece restart rules allow it.
+Important: shared circuits must be generic enough to reconstruct a block range from block-local inputs/params/residuals. They must not be “copy bytes from distant decoded offset” unless that source is stored as an explicit dictionary payload or allowed carry state.
 
-### Add Don't-Care and Observability-Aware Simplification
+### 6.4 Stream Planner Replacement
 
-Exploit local don't-cares from:
+Replace recursive split search with bottom-up DP over range candidates.
 
-- unused/padding bits,
-- deterministic container fields,
-- recomputed CRC/Adler fields,
-- impossible chunk states,
-- predictor branches unused for the selected mode,
-- key-piece boundaries,
-- known row/tile geometry.
+Current `build_best_stream_node` recursively tries splits and occasionally group candidates. New planner:
 
-Use SAT or bit-parallel simulation to validate replacements inside bounded windows.
+```rust
+for span in 1..=max_group_pieces {
+    for start in 0..block_chunk_count - span {
+        evaluate piece/group/fallback/atlas candidates
+        dp[start][end] = min(candidate, split combinations)
+    }
+}
+```
 
-Acceptance criteria:
+Benefits:
 
-- Don't-care use is reported separately from ordinary rewriting.
-- Every don't-care-based replacement has either exhaustive local truth-table validation or SAT validation.
-
-### Add XOR/Affine Detection
-
-Many byte and image transforms are XOR/delta/affine-heavy. Add:
-
-- GF(2) Gaussian elimination for affine relationships,
-- ANF extraction for small windows,
-- XOR divisor extraction,
-- XAG rewriting and balancing,
-- parity predictor candidates.
+- predictable candidate count;
+- easy parallel range evaluation;
+- global cache reuse;
+- easier integration of atlas references;
+- explicit lower bounds for pruning.
 
 Acceptance criteria:
 
-- XOR-heavy synthetic tests compress better than equivalent AIG-only maps.
-- The selected graph representation is visible in benchmark reports.
+- Same or better stream size than current recursive splitter.
+- Planning time is lower and reported.
+- DP can show selected node reason for each range.
 
-### Add Compression-Aware Cost Extraction
+## Phase 7: Container and Preflate Correction Modeling
 
-The current advanced optimizer has ASIC/FPGA-style objectives. Add compression objectives:
+Priority: high for cat challenge ratio.
 
-- serialized topology bytes,
-- parameter bytes,
-- residual entropy estimate,
-- correction bytes,
-- decoder work,
-- stream restart overhead,
-- memory footprint,
-- validation cost.
+The cat challenge is a compressed image-like container. The current generic CRC32 frame detector is useful, but deeper gains require modeling the structure inside the framed deflate payload and correction stream.
+
+### 7.1 Generic Container Analyzer Trait
+
+Add:
+
+```rust
+pub(crate) trait ContainerAnalyzer {
+    fn name(&self) -> &'static str;
+    fn detect(input: &[u8]) -> Option<Self> where Self: Sized;
+    fn extract(&self, input: &[u8]) -> ZbitResult<ContainerModel>;
+    fn rebuild(&self, model: &ContainerModel, payloads: &[&[u8]]) -> ZbitResult<Vec<u8>>;
+}
+```
+
+Implement first:
+
+- generic CRC32 frame run analyzer using current `build_framed_payload_run` logic;
+- PNG-like analyzer when magic/header/chunks validate;
+- zlib/deflate wrapper analyzer;
+- raw framed stream analyzer.
+
+### 7.2 PNG/Image Plane Modeling
+
+For PNG-like inputs:
+
+- parse chunks;
+- split deterministic chunk metadata from payload;
+- concatenate `IDAT` payloads;
+- preflate/inflate to filtered scanlines;
+- extract image geometry: width, height, bit depth, color type, bytes per pixel;
+- split filter bytes from row data;
+- model filter-byte stream separately;
+- reconstruct exact chunks and CRCs.
+
+Reversible transforms to test:
+
+- row predictor residuals: Sub, Up, Average, Paeth;
+- choose best predictor per row/tile;
+- split RGBA channels;
+- byte-plane and bit-plane transpose;
+- reversible color transform: green-subtract, integer YCoCg-style transform;
+- alpha special case;
+- tile-local transforms;
+- repeated row/tile circuit links through the atlas.
+
+### 7.3 Preflate Correction Substreams
+
+Current correction payload is treated too opaquely. Split corrections into typed substreams before coding:
+
+- record kind stream;
+- literal correction stream;
+- length correction stream;
+- distance correction stream;
+- Huffman tree correction stream;
+- block boundary correction stream;
+- raw fallback bytes;
+- sparse position deltas;
+- repeated correction motifs.
+
+Each substream gets its own transform and codec. Then the atlas can find repeated correction circuits across distant blocks or chunks.
 
 Acceptance criteria:
 
-- The optimizer can choose a larger graph if it reduces payload bytes enough.
-- Reports show why a graph candidate won or lost.
+- Reports break down transformed payload bytes vs correction bytes by substream.
+- Cat challenge deep profile improves beyond current `0.899412` baseline.
+- Preflate roundtrip validation remains byte-perfect.
 
-## Phase 4: Streaming Architecture
+## Phase 8: Deep Candidate Generation for “Best Compression Rate” Profiles
 
-Priority: high after parallel candidate work.
+Priority: medium-high; only after cache and atlas selection exist.
 
-### Parallel Key-Piece Blocks
+The `research` profile should search broadly but not blindly. Use caches and lower bounds.
 
-Build stream blocks independently in parallel, then serialize them deterministically.
+### 8.1 Profile Budgets
+
+Extend `CompressionProfile` with explicit budgets:
+
+```rust
+pub(crate) struct CompressionBudgets {
+    pub max_segments: usize,
+    pub max_occurrences_per_bucket: usize,
+    pub max_pair_candidates: usize,
+    pub max_circuit_candidates: usize,
+    pub max_cut_inputs: u8,
+    pub max_atlas_dictionary_bytes: usize,
+    pub max_time_ms: Option<u64>,
+    pub max_memory_bytes: Option<usize>,
+}
+```
+
+Suggested defaults:
+
+| Profile | Purpose | Atlas search | Cut inputs | Persistent cache |
+| --- | --- | --- | ---: | --- |
+| `fast` | practical quick encode | off or tiny | 0-4 | read-only hints |
+| `balanced` | default useful mode | bounded exact + sparse links | 6 | on if enabled |
+| `deep` | ratio-first | broad transformed links | 8 | on |
+| `research` | exhaustive experiments | maximal with pruning | 10-12 | on |
+
+### 8.2 Lower Bounds and Early Rejection
+
+Before fully encoding candidates, estimate:
+
+- minimum possible residual bytes;
+- dictionary amortization lower bound;
+- stream restart overhead;
+- codec lower bound from entropy estimate;
+- transform parameter cost;
+- validation overhead.
+
+Reject candidates that cannot beat current best.
 
 Acceptance criteria:
 
-- Resume decode behavior remains unchanged.
-- Stream output is byte-identical across runs for deterministic profiles.
+- Deep/research modes expose candidate counts and rejection reasons.
+- Expensive candidates are not evaluated after their lower bound loses.
 
-### Replace Recursive Split Search With Bottom-Up DP
-
-Current stream grouping recursively tries splits within each key-piece block. Convert to bottom-up dynamic programming with precomputed range candidates:
-
-- precompute piece and group costs,
-- restrict group spans by profile,
-- reuse previous-block grouping shape hints,
-- use local/global candidate lower bounds,
-- keep a fallback exact search for small blocks.
-
-Acceptance criteria:
-
-- Same or better stream encoded size for current default chunk/key settings.
-- Stream block planning time is visible and materially reduced.
-
-### Add Shared Dictionaries Without Full Wide Overfit
-
-Generalize the current shared-grouping payload into explicit shared dictionaries:
-
-- shared transform graph dictionary,
-- shared preflate correction model,
-- shared codec dictionaries,
-- per-key-piece residual payloads,
-- restart-safe dependency metadata.
-
-Acceptance criteria:
-
-- Non-wide realtime mode improves ratio without requiring every block to reference a full-file decoded global slice.
-- Key-piece resume validation remains PASS.
-
-## Phase 5: Benchmark, Validation, and Regression Policy
+## Phase 9: Benchmark and Regression Policy
 
 Priority: ongoing.
 
-### Add Ratio and Time Gates
+### 9.1 Add New Corpora
 
-Track separate gates for:
+Current corpora are too few. Add:
 
-- paper benchmark,
-- `assets/primary.3b.bin`,
-- cat challenge real-file,
-- cat challenge stream,
-- synthetic predictor-heavy corpus,
-- synthetic XOR/affine corpus,
-- random incompressible corpus.
+- repeated distant chunks with small patches;
+- repeated transformed chunks;
+- XOR/affine-heavy synthetic data;
+- PNG-like filtered scanlines;
+- random incompressible data;
+- mixed structured/unstructured data;
+- stream-specific multi-block repeated structure;
+- adversarial collision-like chunks for hash validation.
 
-Acceptance criteria:
+### 9.2 New Report Fields
 
-- CI can run quick gates.
-- Deep/research gates remain ignored/manual unless explicitly requested.
+Add to normal and stream reports:
 
-### Add Competitor Baselines
+```text
+Atlas:
+- atlas enabled: true/false
+- discovered segments
+- exact links considered/selected
+- transformed links considered/selected
+- shared circuit count
+- local circuit count
+- graph dictionary bytes
+- reference bytes
+- residual bytes
+- fallback bytes
+- cache hits/misses by namespace
+- dependency violations rejected
+- validation failures rejected
+```
 
-Record optional comparison numbers for:
+### 9.3 Ratio Targets
 
-- raw zstd levels,
-- raw xz presets,
-- deflate/zlib,
-- PNG optimizer path where applicable,
-- current zBit candidate winner.
+Initial realistic targets:
 
-Acceptance criteria:
+| Benchmark | Current | First target | Deep target |
+| --- | ---: | ---: | ---: |
+| cat challenge normal | `0.899412` | `< 0.890` | `< 0.875` |
+| cat challenge stream non-wide atlas | `0.899455` with global/slice | `< 0.905` without global output slice | `< 0.890` without global output slice |
+| `primary.3b.bin` | `0.174058` | no regression | `< 0.170` |
+| paper markdown | `0.332694` | no regression | `< 0.320` |
+| distant-repeat synthetic | new | beat zstd/xz by clear margin | near reference+patch theoretical cost |
 
-- Benchmark reports make it clear when zBit is beating a generic codec and when it is not.
-
-### Add Determinism Checks
-
-For every profile:
-
-- same input,
-- same options,
-- same output bytes,
-- same decompressed bytes,
-- stable report fields except timings and resource usage.
-
-Acceptance criteria:
-
-- Deterministic benchmark mode can be used for regression diffs.
+Aggressive “best compression rate than ever” targets should live in `research` profile until they are fast and robust enough for `balanced`.
 
 ## Suggested Implementation Order
 
-1. Add per-candidate timing and profile selection.
-2. Add parallel top-level candidate evaluation with deterministic result collection.
-3. Parallelize transform-plan, codec-profile, and preflate-chain searches.
-4. Add container analyzer trait and PNG-like analyzer.
-5. Add image-plane/residual transform DAGs.
-6. Split and model preflate corrections.
-7. Add canonical ID-based graph core for circuit maps.
-8. Add AIG/XAG map generation for predictors and correction classifiers.
-9. Add cut enumeration, NPN cache, and exact local replacement.
-10. Add compression-aware graph cost extraction.
-11. Rework stream block planning as parallel bottom-up DP.
-12. Add shared graph/correction dictionaries for non-wide stream mode.
+1. Add `CompressionContext` and promote stream caches to stream/global scope.
+2. Split `pack.rs` into modules without behavior changes.
+3. Add stable payload fingerprints and memoized codec/transform/preflate caches.
+4. Add multi-scale segmentation and occurrence indexing.
+5. Add exact and transformed nonlocal reference candidates with sparse residuals.
+6. Add `circuit_graph.rs` canonical graph core.
+7. Add `atlas.rs` with dictionary, link, residual, and selector structures.
+8. Add normal-mode `PackMethod::CircuitAtlas` behind a profile/env gate.
+9. Validate atlas decode with strict byte comparison and checksum.
+10. Add stream shared-circuit atlas dictionary and atlas-ref nodes.
+11. Replace stream recursive split planner with bottom-up DP.
+12. Add PNG/image-plane analyzer and typed preflate correction substreams.
+13. Add cut rewriting, XOR/affine detection, and compression-aware graph optimization.
+14. Expand benchmark corpus and add atlas-specific regression gates.
 
-## General References
+## Concrete File-Level Changes
 
-Local reference:
+### `zbit-rs/src/pack_rules.rs`
 
-- `papers/zbit-algorithmsResearch.md`
+- Add `PackMethod::CircuitAtlas`.
+- Add `circuit_atlas_total_bytes: Option<usize>` to `PackEvaluation`.
+- Update `choose_best_method` to compare atlas candidate after validation.
+- Add reason strings that separate atlas dictionary/reference/residual costs.
 
-Logic synthesis and circuit simplification:
+### `zbit-rs/src/pack.rs` or new `pack/mod.rs`
 
-- R. E. Bryant, "Graph-Based Algorithms for Boolean Function Manipulation," IEEE Transactions on Computers, 1986.
-- R. E. Bryant, "Symbolic Boolean Manipulation with Ordered Binary Decision Diagrams," ACM Computing Surveys, 1992.
-- R. K. Brayton, G. D. Hachtel, C. T. McMullen, A. Sangiovanni-Vincentelli, "Logic Synthesis for VLSI Design," Kluwer, 1984/1989.
-- R. Rudell, "Multiple-Valued Logic Minimization for PLA Synthesis," Berkeley technical report, 1986.
-- A. Mishchenko, S. Chatterjee, R. Brayton, "DAG-Aware AIG Rewriting: A Fresh Look at Combinational Logic Synthesis," DAC 2006.
-- R. Brayton, A. Mishchenko, "ABC: An Academic Industrial-Strength Verification Tool," CAV 2010.
-- A. Mishchenko, R. Brayton, J.-H. Jiang, S. Jang, "Scalable Don't-Care-Based Logic Optimization and Resynthesis," ACM TRETS, 2011.
-- M. Soeken et al., "Practical Exact Synthesis," DATE 2018.
+- Add `CompressionContext`.
+- Pass context through pack, recursive, codec, transform, and stream functions.
+- Add atlas candidate creation before final method choice.
+- Add new decode branch for atlas method.
+- Add stats fields for atlas and cache metrics.
 
-Compression and container modeling:
+### `zbit-rs/src/pack/cache.rs`
 
-- P. Deutsch, "DEFLATE Compressed Data Format Specification," RFC 1951.
-- P. Deutsch, "ZLIB Compressed Data Format Specification," RFC 1950.
-- PNG Specification, W3C Recommendation / ISO/IEC 15948.
-- LZMA SDK documentation and XZ Utils design notes for LZMA2 tuning.
-- Zstandard documentation and dictionary training references.
-- Preflate-style deflate reconstruction literature and implementation notes.
+- Add `PayloadHash`.
+- Add `CompressionCache`.
+- Add memory budgeting and optional persistent cache hooks.
+- Add collision-safe verification policy.
 
+### `zbit-rs/src/pack/atlas.rs`
+
+- Add `Segment`, `OccurrenceIndex`, `CircuitLinkCandidate`, `ResidualModel`, `AtlasDictionary`, `AtlasRangeOp`, and selector.
+- Implement exact-copy, transformed-reference, sparse-patch, and fallback candidates first.
+- Keep graph simplification optional at first; make the format capable of storing graph IDs now.
+
+### `zbit-rs/src/circuit_graph.rs`
+
+- Add canonical ID-based graph core.
+- Add structural hashing, fanout counts, topological serialization, graph signatures, and basic rewrites.
+
+### `zbit-rs/src/pack/stream.rs`
+
+- Add shared-circuit atlas flag and node kinds.
+- Replace per-block `pack_cache` with context/shared cache.
+- Implement bottom-up range DP.
+- Add key-piece dependency validation.
+
+### `zbit-rs/src/bin/benchmark_real_file.rs`
+
+- Print atlas stats and cache stats.
+- Print candidate lower-bound rejection counts.
+- Print whether persistent cache was used.
+
+### `zbit-rs/src/bin/benchmark_stream_real_file.rs`
+
+- Print global-output-slice vs shared-circuit-atlas separately.
+- Print key-piece dependency validation results.
+- Print per-block atlas/fallback/residual byte breakdown.
+
+## Safety and Correctness Rules
+
+- Every selected candidate must roundtrip before becoming eligible for final selection.
+- All cross-region references must be range-checked.
+- Range programs must reject overlaps and gaps unless explicitly allowed and initialized.
+- Hashes are lookup accelerators only; full validation or strong hashes are required for reuse.
+- Persistent cache never becomes a decode dependency.
+- Stream key-piece resume must be tested for every mode that claims restart support.
+- Format version bumps must preserve old decoder behavior.
+- Random incompressible data must never grow beyond the current raw-copy safety fallback except for explicitly allowed small metadata overhead in experimental reports.
+
+## Long-Term Vision
+
+The full potential of this project is unlocked when the compressor behaves like a circuit/link optimizer over the entire file, not like a sequence of isolated codec trials.
+
+The desired final behavior is:
+
+- detect that distant byte ranges share a hidden generation rule;
+- convert those ranges into a shared circuit plus small residuals;
+- simplify the shared circuit graph;
+- cache the discovery so repeated runs get faster;
+- serialize only the circuits that actually reduce total size;
+- let stream blocks reference shared circuits without requiring full-file decode;
+- preserve exact byte-for-byte output validation.
+
+At that point, `zBit` becomes a real circuit-based compressor: not merely compressing bytes, but compressing the reusable logic that generates bytes.
