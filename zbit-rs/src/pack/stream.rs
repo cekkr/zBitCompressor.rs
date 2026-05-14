@@ -6,8 +6,12 @@ fn compress_stream_realtime_pack_bytes(
     allow_recursive_candidate: bool,
     context: &mut CompressionContext,
 ) -> ZbitResult<(Vec<u8>, PackMethod)> {
-    let raw_deflate_payload = build_raw_deflate_payload(input)?;
-    let raw_zstd_payload = build_raw_zstd_payload(input)?;
+    let raw_deflate_payload = build_raw_deflate_payload_with_compression(
+        input,
+        context.profile.realtime_deflate_compression(),
+    )?;
+    let raw_zstd_payload =
+        build_raw_zstd_payload_with_level(input, context.profile.realtime_zstd_level())?;
 
     let empty_stream = IndexStream {
         unique_symbols: Vec::new(),
@@ -134,10 +138,15 @@ fn compress_stream_realtime_pack_bytes(
 
 fn compress_stream_wide_overfit_pack_bytes(
     input: &[u8],
+    allow_recursive_candidate: bool,
     context: &mut CompressionContext,
 ) -> ZbitResult<(Vec<u8>, PackMethod)> {
-    let raw_deflate_payload = build_raw_deflate_payload(input)?;
-    let raw_zstd_payload = build_raw_zstd_payload(input)?;
+    let raw_deflate_payload = build_raw_deflate_payload_with_compression(
+        input,
+        context.profile.realtime_deflate_compression(),
+    )?;
+    let raw_zstd_payload =
+        build_raw_zstd_payload_with_level(input, context.profile.realtime_zstd_level())?;
 
     let empty_stream = IndexStream {
         unique_symbols: Vec::new(),
@@ -212,30 +221,38 @@ fn compress_stream_wide_overfit_pack_bytes(
         )?;
         candidates.push((PackMethod::FramedRaw, framed_bytes));
 
-        if let Some(recursive_stream) = build_recursive_circuit_stream(input, &framed_run, context)?
-        {
-            let recursive_bytes = write_pack_bytes(
-                PackMethod::RecursiveCircuitXz,
-                input,
-                &empty_stream,
-                None,
-                0,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(&recursive_stream),
-                None,
-            )?;
-            let validation_timer = Instant::now();
-            if let Ok(decoded) = decompress_pack_bytes(&recursive_bytes) {
-                if decoded == input {
-                    candidates.push((PackMethod::RecursiveCircuitXz, recursive_bytes));
+        if allow_recursive_candidate {
+            if let Some(recursive_stream) =
+                build_recursive_circuit_stream(input, &framed_run, context)?
+            {
+                let recursive_bytes = write_pack_bytes(
+                    PackMethod::RecursiveCircuitXz,
+                    input,
+                    &empty_stream,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&recursive_stream),
+                    None,
+                )?;
+                let validation_timer = Instant::now();
+                if let Ok(decoded) = decompress_pack_bytes(&recursive_bytes) {
+                    if decoded == input {
+                        candidates.push((PackMethod::RecursiveCircuitXz, recursive_bytes));
+                    }
                 }
+                context.timings.candidate_validation_ms +=
+                    validation_timer.elapsed().as_secs_f64() * 1000.0;
             }
-            context.timings.candidate_validation_ms +=
-                validation_timer.elapsed().as_secs_f64() * 1000.0;
+        } else {
+            context.push_skipped(format!(
+                "stream wide/global recursive candidate skipped by '{}' profile",
+                context.profile.name()
+            ));
         }
     }
 
@@ -474,7 +491,7 @@ fn build_best_stream_node(
     };
 
     let mut best_split: Option<StreamNode> = None;
-    for mid in (start + 1)..end {
+    for mid in context.profile.stream_split_points(start, end) {
         let left = build_best_stream_node(
             chunks,
             start,
@@ -883,9 +900,16 @@ fn compress_stream_to_bytes(
         && options.realtime_mode
         && block_count > 1
         && input.len() >= (1024 * 1024)
+        && context.profile.should_attempt_stream_shared_grouping_payload()
     {
         let shared_timer = Instant::now();
-        let (pack_bytes, _) = compress_stream_wide_overfit_pack_bytes(input, &mut context)?;
+        let (pack_bytes, _) = compress_stream_wide_overfit_pack_bytes(
+            input,
+            context
+                .profile
+                .should_attempt_recursive_on_stream_shared_payload(),
+            &mut context,
+        )?;
         match decompress_pack_bytes(&pack_bytes) {
             Ok(decoded) if decoded == input => {
                 flags |= ZBPS_FLAG_SHARED_GROUPING_PAYLOAD;
@@ -903,13 +927,27 @@ fn compress_stream_to_bytes(
             }
         }
     } else {
+        if !options.wide_overfitting_circuits
+            && options.realtime_mode
+            && block_count > 1
+            && input.len() >= (1024 * 1024)
+            && !context.profile.should_attempt_stream_shared_grouping_payload()
+        {
+            context.push_skipped(format!(
+                "shared grouping payload skipped by '{}' profile",
+                context.profile.name()
+            ));
+        }
         None
     };
 
     if options.wide_overfitting_circuits {
         let global_timer = Instant::now();
-        let (global_pack_bytes, global_method) =
-            compress_stream_wide_overfit_pack_bytes(input, &mut context)?;
+        let (global_pack_bytes, global_method) = compress_stream_wide_overfit_pack_bytes(
+            input,
+            true,
+            &mut context,
+        )?;
         context.timings.stream_global_payload_ms += global_timer.elapsed().as_secs_f64() * 1000.0;
         let mut out = Vec::with_capacity(
             ZBPS_HEADER_BYTES
@@ -1420,4 +1458,3 @@ pub fn decompress_stream_file_from_key_piece(
     let bytes = fs::read(path)?;
     decompress_stream_from_bytes(&bytes, Some(key_piece_index))
 }
-

@@ -293,10 +293,10 @@ Current snapshot (reports generated on 2026-05-07):
 
 | Profile | Ratio | Savings | Original -> Compressed (bytes) | Compression ms | Decompression ms | Compression MiB/s | Decompression MiB/s | Compression RSS delta KiB | Decompression RSS delta KiB | Peak RSS KiB | Validation | Resume |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `realtime-fast` | `0.899597` | `10.04%` | `2969404 -> 2671266` | `137820.970` | `9654.720` | `0.021` | `0.293` | `553200` | `624` | `3407188` | `PASS` | `PASS` |
-| `realtime-balanced` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `127023.717` | `9803.588` | `0.022` | `0.289` | `464940` | `18588` | `3392504` | `PASS` | `PASS` |
-| `realtime-deep` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `127886.368` | `9626.080` | `0.022` | `0.294` | `573212` | `2768` | `3412220` | `PASS` | `PASS` |
-| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `109886.203` | `9612.017` | `0.026` | `0.295` | `515828` | `1900` | `3410564` | `PASS` | `PASS` |
+| `realtime-fast` | `0.999011` | `0.10%` | `2969404 -> 2966468` | `1444.139` | `6.678` | `1.961` | `424.027` | `n/a` | `n/a` | `n/a` | `PASS` | `PASS` |
+| `realtime-balanced` | `0.998602` | `0.14%` | `2969404 -> 2965252` | `3807.462` | `5.926` | `0.744` | `477.841` | `n/a` | `n/a` | `n/a` | `PASS` | `PASS` |
+| `realtime-deep` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `280198.816` | `8386.378` | `0.010` | `0.338` | `n/a` | `n/a` | `n/a` | `PASS` | `PASS` |
+| `wide-overfit` | `0.899455` | `10.05%` | `2969404 -> 2670846` | `257437.597` | `8496.314` | `0.011` | `0.333` | `n/a` | `n/a` | `n/a` | `PASS` | `PASS` |
 
 Latest outputs for the tracked tests are written to:
 

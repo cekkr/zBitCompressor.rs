@@ -99,6 +99,58 @@ impl CompressionProfile {
     fn should_attempt_recursive_on_realtime_blocks(self) -> bool {
         !matches!(self, Self::Fast)
     }
+
+    fn realtime_deflate_compression(self) -> Compression {
+        match self {
+            Self::Fast => Compression::fast(),
+            Self::Balanced => Compression::new(6),
+            Self::Deep | Self::Research => Compression::best(),
+        }
+    }
+
+    fn realtime_zstd_level(self) -> i32 {
+        match self {
+            Self::Fast => 1,
+            Self::Balanced => 6,
+            Self::Deep => 12,
+            Self::Research => 19,
+        }
+    }
+
+    fn stream_split_points(self, start: usize, end: usize) -> Vec<usize> {
+        let chunk_span = end.saturating_sub(start);
+        if chunk_span <= 1 {
+            return Vec::new();
+        }
+
+        match self {
+            Self::Fast => vec![start + (chunk_span / 2)],
+            Self::Balanced => {
+                if chunk_span <= 4 {
+                    ((start + 1)..end).collect()
+                } else {
+                    let mut mids = vec![
+                        start + (chunk_span / 2),
+                        start + (chunk_span / 3),
+                        start + ((chunk_span * 2) / 3),
+                    ];
+                    mids.retain(|mid| *mid > start && *mid < end);
+                    mids.sort_unstable();
+                    mids.dedup();
+                    mids
+                }
+            }
+            Self::Deep | Self::Research => ((start + 1)..end).collect(),
+        }
+    }
+
+    fn should_attempt_stream_shared_grouping_payload(self) -> bool {
+        !matches!(self, Self::Fast)
+    }
+
+    fn should_attempt_recursive_on_stream_shared_payload(self) -> bool {
+        matches!(self, Self::Deep | Self::Research)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1787,4 +1839,3 @@ fn split_stream_chunks(input: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
         .map(|chunk| chunk.to_vec())
         .collect()
 }
-

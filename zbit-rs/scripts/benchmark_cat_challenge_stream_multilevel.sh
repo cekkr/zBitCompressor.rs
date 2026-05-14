@@ -35,20 +35,20 @@ print(f"asset-bytes={len(data)} ({size_mb:.2f} MiB) | header8={data[:8].hex() if
 PY
 
 profiles=(
-  "realtime-fast|65536|4|1|4|true|false|true"
-  "realtime-balanced|262144|8|2|8|true|false|true"
-  "realtime-deep|262144|8|3|8|true|false|true"
-  "wide-overfit|262144|8|2|8|true|true|true"
+  "realtime-fast|fast|65536|4|1|4|true|false|true"
+  "realtime-balanced|balanced|262144|8|2|8|true|false|true"
+  "realtime-deep|deep|262144|8|3|8|true|false|true"
+  "wide-overfit|deep|262144|8|2|8|true|true|true"
 )
 
 for profile in "${profiles[@]}"; do
-  IFS='|' read -r name chunk key depth group realtime wide carry <<<"$profile"
+  IFS='|' read -r name compression_profile chunk key depth group realtime wide carry <<<"$profile"
 
   pack_path="$work_dir/${name}.zbps"
   report_path="$work_dir/${name}.report.txt"
 
-  echo "Running profile=$name chunk=$chunk key=$key depth=$depth group=$group realtime=$realtime wide=$wide carry=$carry"
-  cargo run --manifest-path "$repo_root/zbit-rs/Cargo.toml" --bin zbit-benchmark-stream -- \
+  echo "Running profile=$name compression_profile=$compression_profile chunk=$chunk key=$key depth=$depth group=$group realtime=$realtime wide=$wide carry=$carry"
+  ZBIT_COMPRESSION_PROFILE="$compression_profile" cargo run --manifest-path "$repo_root/zbit-rs/Cargo.toml" --bin zbit-benchmark-stream -- \
     "$asset_path" \
     "$pack_path" \
     "$report_path" \

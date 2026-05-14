@@ -2,11 +2,18 @@
 // Copyright (c) 2026 Riccardo Cecchini <rcecchini.ds@gmail.com>.
 
 fn build_raw_deflate_payload(input: &[u8]) -> ZbitResult<Vec<u8>> {
+    build_raw_deflate_payload_with_compression(input, Compression::best())
+}
+
+fn build_raw_deflate_payload_with_compression(
+    input: &[u8],
+    compression: Compression,
+) -> ZbitResult<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    let mut encoder = ZlibEncoder::new(Vec::new(), compression);
     encoder
         .write_all(input)
         .map_err(|e| ZbitError::Io(format!("zlib write failed: {e}")))?;
@@ -33,7 +40,11 @@ fn decode_raw_deflate_payload(payload: &[u8], original_size: usize) -> ZbitResul
 }
 
 fn build_raw_zstd_payload(input: &[u8]) -> ZbitResult<Vec<u8>> {
-    zstd_stream::encode_all(input, 19)
+    build_raw_zstd_payload_with_level(input, 19)
+}
+
+fn build_raw_zstd_payload_with_level(input: &[u8], level: i32) -> ZbitResult<Vec<u8>> {
+    zstd_stream::encode_all(input, level)
         .map_err(|e| ZbitError::Io(format!("zstd encode failed: {e}")))
 }
 
